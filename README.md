@@ -5,7 +5,7 @@ Convert Supabase row-level-security policies to portable, vanilla PostgreSQL.
 Supabase RLS is standard `CREATE POLICY` plus a platform-provided context:
 `auth.uid()`, `auth.jwt()`, `auth.role()`, the `anon`/`authenticated`/
 `service_role` pseudo-roles, and PostgREST injecting a verified JWT into a
-session GUC on every request. None of that exists on plain Postgres — which is
+session GUC on every request. None of that exists on plain Postgres - which is
 why RLS is usually the thing that keeps a project stuck. capyrls re-homes the
 policies so they run anywhere: RDS, self-hosted, CapyDB, any Postgres.
 
@@ -32,7 +32,7 @@ capyrls_out/
 
 ## What the conversion does
 
-**Vanilla mode (default)** — the idiomatic plain-Postgres convention: a small
+**Vanilla mode (default)** - the idiomatic plain-Postgres convention: a small
 `app.*` schema of `stable` accessor functions over transaction-local GUCs. The
 database stops knowing JWTs exist; your app verifies the caller at the edge and
 sets typed facts per transaction:
@@ -40,7 +40,7 @@ sets typed facts per transaction:
 | Supabase | becomes |
 |---|---|
 | `auth.uid()` | `(select app.user_id())` |
-| `auth.jwt() ->> 'org_id'` | `(select app.org_id())` — each claim promoted to its own GUC |
+| `auth.jwt() ->> 'org_id'` | `(select app.org_id())` - each claim promoted to its own GUC |
 | `auth.role()` / `auth.email()` | `(select app.role())` / `(select app.email())` |
 | deep claim paths | `(select app.claims())` blob fallback, flagged in the report |
 | `TO authenticated` | runtime role + `(select app.user_id()) is not null` |
@@ -48,7 +48,7 @@ sets typed facts per transaction:
 | `service_role` | a `BYPASSRLS` role (or the single-role service escape) |
 | `FOR ALL` policies | split into per-command policies (disable with `--keep-for-all`) |
 
-Your app sets the context inside each transaction — `set_config(..., true)` is
+Your app sets the context inside each transaction - `set_config(..., true)` is
 `SET LOCAL` semantics, safe behind transaction pooling:
 
 ```sql
@@ -60,7 +60,7 @@ commit;
 
 Unset context reads as NULL, so every policy fails closed.
 
-**Compat mode (`--mode supabase-compat`)** — a zero-risk lift-and-shift: emits
+**Compat mode (`--mode supabase-compat`)** - a zero-risk lift-and-shift: emits
 an `auth.*` shim backed by the `request.jwt.claims` GUC and ports policies
 verbatim. Good first step; adopt the vanilla convention later.
 
@@ -68,7 +68,7 @@ verbatim. Good first step; adopt the vanilla convention later.
 
 - `--role-model split` (default): creates `app_user` (runtime, cannot bypass
   RLS) and `app_service` (`BYPASSRLS`, replaces `service_role`). Owners bypass
-  RLS in Postgres — runtime traffic must never connect as the role that owns
+  RLS in Postgres - runtime traffic must never connect as the role that owns
   the tables, and this model makes that structural.
 - `--role-model single`: for managed platforms where the app connects as the
   table owner. Emits `FORCE ROW LEVEL SECURITY` plus an optional GUC-gated

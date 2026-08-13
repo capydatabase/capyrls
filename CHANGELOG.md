@@ -9,10 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `capyrls convert` — builds a portable SQL bundle (context prelude, role
+- `capyrls convert` - builds a portable SQL bundle (context prelude, role
   setup, converted policies) from Supabase migration folders, schema dumps,
   stdin, or a live database (`--db`).
-- `capyrls rewrite` — rewrites `auth.*` calls inside existing SQL files while
+- `capyrls rewrite` - rewrites `auth.*` calls inside existing SQL files while
   keeping migration history byte-identical elsewhere.
 - Vanilla convention output: `app.*` accessor functions over transaction-local
   GUCs, JWT claim promotion (`auth.jwt() ->> 'org_id'` → `app.org_id()`),
