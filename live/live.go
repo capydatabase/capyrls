@@ -113,7 +113,7 @@ func parseRoles(joined string) []string {
 		return nil
 	}
 	var roles []string
-	for _, role := range strings.Split(joined, ",") {
+	for role := range strings.SplitSeq(joined, ",") {
 		role = strings.TrimSpace(role)
 		if role == "" || role == "public" {
 			continue

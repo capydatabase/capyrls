@@ -263,7 +263,7 @@ func fileHeader(purpose string) string {
 
 func writeSQLFunction(b *strings.Builder, comment, name, returns, body string) {
 	if comment != "" {
-		for _, line := range strings.Split(comment, "\n") {
+		for line := range strings.SplitSeq(comment, "\n") {
 			fmt.Fprintf(b, "-- %s\n", line)
 		}
 	}

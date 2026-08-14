@@ -2,6 +2,7 @@ package capyrls
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -55,10 +56,8 @@ func newRewriter(d dialectKind, prefix string) *rewriter {
 
 func (rw *rewriter) warn(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	for _, w := range rw.warnings {
-		if w == msg {
-			return
-		}
+	if slices.Contains(rw.warnings, msg) {
+		return
 	}
 	rw.warnings = append(rw.warnings, msg)
 }

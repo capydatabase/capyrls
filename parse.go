@@ -531,7 +531,7 @@ func scanColumnDefault(cat *Catalog, table QName, element []token, stmt statemen
 // column-constraint keyword.
 func defaultExprIn(element []token, stmt statement) string {
 	depth := 0
-	for i := 0; i < len(element); i++ {
+	for i := range element {
 		t := element[i]
 		if t.Kind == tOp {
 			switch t.Text {
@@ -606,19 +606,19 @@ func parseCreateRoutine(cat *Catalog, c *cursor, stmt statement) {
 func noteAuthRefs(cat *Catalog, stmt statement) {
 	if tokensReferenceAuth(stmt.toks) {
 		firstSig := nextSig(stmt.toks, 0)
-		head := ""
+		var head strings.Builder
 		for k, j := 0, firstSig; k < 3 && j < len(stmt.toks); k++ {
-			head += stmt.toks[j].Text + " "
+			head.WriteString(stmt.toks[j].Text + " ")
 			j = nextSig(stmt.toks, j+1)
 		}
-		cat.note(fmt.Sprintf("%s: statement %q references auth.* and is outside the converter's scope - review manually", stmt.origin, strings.TrimSpace(head)+" ..."))
+		cat.note(fmt.Sprintf("%s: statement %q references auth.* and is outside the converter's scope - review manually", stmt.origin, strings.TrimSpace(head.String())+" ..."))
 	}
 }
 
 // tokensReferenceAuth reports whether a token stream contains a reference to
 // the auth schema (auth.<anything>).
 func tokensReferenceAuth(toks []token) bool {
-	for i := 0; i < len(toks); i++ {
+	for i := range toks {
 		t := toks[i]
 		isAuth := t.Kind == tIdent && t.Val == "auth" || t.Kind == tQIdent && t.Val == "auth"
 		if !isAuth {

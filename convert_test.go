@@ -157,7 +157,7 @@ func TestConvertVanillaSplitRoles(t *testing.T) {
 		// The commented-out has_account block legitimately contains auth
 		// references; strip comment lines before checking.
 		var live []string
-		for _, line := range strings.Split(policies, "\n") {
+		for line := range strings.SplitSeq(policies, "\n") {
 			if !strings.HasPrefix(strings.TrimSpace(line), "--") {
 				live = append(live, line)
 			}
@@ -325,7 +325,7 @@ func TestConvertIdempotentSQL(t *testing.T) {
 	}
 	policies := findFile(t, res, "capyrls_03_policies.sql")
 	var live []string
-	for _, line := range strings.Split(policies, "\n") {
+	for line := range strings.SplitSeq(policies, "\n") {
 		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
 			live = append(live, line)
 		}
