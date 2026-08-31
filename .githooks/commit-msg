@@ -54,8 +54,11 @@ else
 		*.) fail "subject may not end with a period [subject-full-stop]" ;;
 	esac
 
+	# The letters are enumerated rather than written as the range [A-Z]: bracket ranges follow the
+	# locale's collation order, and under bash 3.2 (macOS /bin/sh) in a UTF-8 locale that order is
+	# aAbB...zZ, so [A-Z] also matches lowercase b-z and rejects almost every valid subject.
 	case "$subject" in
-		[A-Z]*) fail "subject may not start with an uppercase letter [subject-case]" ;;
+		[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) fail "subject may not start with an uppercase letter [subject-case]" ;;
 	esac
 fi
 

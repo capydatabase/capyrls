@@ -1,6 +1,7 @@
 # capyrls
 
-Convert Supabase row-level-security policies to portable, vanilla PostgreSQL.
+**Supabase RLS → any Postgres.** A converter that rewrites `auth.uid()`-style
+row-level-security policies into portable, vanilla PostgreSQL.
 
 Supabase RLS is standard `CREATE POLICY` plus a platform-provided context:
 `auth.uid()`, `auth.jwt()`, `auth.role()`, the `anon`/`authenticated`/
