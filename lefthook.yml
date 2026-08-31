@@ -1,0 +1,7 @@
+# https://lefthook.dev/configuration/
+# No Node toolchain in this repo, so the commit-msg gate is a dependency-free shell mirror of
+# .commitlintrc.yml. CI runs the real commitlint against that file, so drift fails on push.
+commit-msg:
+  jobs:
+    - name: commit message convention
+      run: ./.githooks/commit-msg {1}

@@ -1,0 +1,80 @@
+name: Commit messages
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  commitlint:
+    name: commitlint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # Only commits introduced by this push or PR are linted. History predating the convention
+      # is never re-checked, so this can never fail on commits nobody is adding right now.
+      - name: Resolve commit range
+        id: range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            from="$BASE_SHA"
+            to="$HEAD_SHA"
+          else
+            to="$PUSH_SHA"
+            if [ -n "${BEFORE_SHA:-}" ] \
+              && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+              && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              # Normal push. A force-push leaves BEFORE_SHA unreachable and unfetched, so the
+              # cat-file probe fails and we fall through to linting the tip commit only.
+              from="$BEFORE_SHA"
+            elif git rev-parse -q --verify "${to}^" >/dev/null; then
+              from="${to}^"
+            else
+              from=""
+            fi
+          fi
+          echo "from=$from" >> "$GITHUB_OUTPUT"
+          echo "to=$to" >> "$GITHUB_OUTPUT"
+
+      - name: Lint commit messages
+        env:
+          FROM: ${{ steps.range.outputs.from }}
+          TO: ${{ steps.range.outputs.to }}
+        run: |
+          set -euo pipefail
+          # Pinned rather than taken from the repo so every repo - Go, Ansible, Python and Node
+          # alike - checks against the same commitlint. Rules come from .commitlintrc.yml.
+          lint() {
+            npx --yes \
+              -p @commitlint/cli@21.2.2 \
+              -p @commitlint/config-conventional@21.2.2 \
+              commitlint "$@"
+          }
+          if [ -z "$FROM" ]; then
+            lint --last --verbose
+          else
+            lint --from "$FROM" --to "$TO" --verbose
+          fi

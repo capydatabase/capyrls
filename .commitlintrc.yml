@@ -1,0 +1,14 @@
+# Conventional Commits rules for every CapyDB repo. Keep this file byte-identical across all
+# repos - docs/commit-conventions.md in the workspace is the canon, and the dependency-free
+# .githooks/commit-msg used by the non-Node repos is a mirror of these rules.
+#
+# Enforced locally by lefthook (commit-msg hook) and in CI by .github/workflows/commitlint.yml.
+extends:
+  - "@commitlint/config-conventional"
+
+rules:
+  # config-conventional defaults both of these to [2, always, 100]. Commit bodies here are prose
+  # and bullet lists, and footers carry long URLs and refs - hard-wrapping at 100 fires on almost
+  # every multi-paragraph commit without making anything more readable.
+  body-max-line-length: [0, always, 100]
+  footer-max-line-length: [0, always, 100]
