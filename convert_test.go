@@ -289,6 +289,95 @@ func TestConvertNoSplitAll(t *testing.T) {
 	}
 }
 
+// helperFixture is the pattern found in the wild: a custom helper whose body
+// reads auth.*, called from policies whose own text has no auth.* reference,
+// plus a plain helper that must stay unannotated.
+var helperFixture = []Source{
+	{Name: "helpers.sql", SQL: `
+create function public.clerk_user_id() returns text language sql stable as $$
+  select auth.jwt() ->> 'sub'
+$$;
+create function public.is_positive(n int) returns boolean language sql immutable as $$
+  select n > 0
+$$;
+create function auth.uid() returns uuid language sql as $$
+  select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid
+$$;
+create table public.notes (id bigint primary key, owner text, n int);
+alter table public.notes enable row level security;
+
+create policy notes_owner on public.notes
+  for select using (clerk_user_id() = owner);
+
+create policy notes_owner_write on public.notes
+  for update using (public.clerk_user_id() = owner);
+
+create policy notes_positive on public.notes
+  for select using (is_positive(n));
+
+create policy notes_uid on public.notes
+  for delete using (auth.uid()::text = owner);
+`},
+}
+
+func TestConvertHelperLinkage(t *testing.T) {
+	cases := []struct {
+		name        string
+		opts        Options
+		wantDetail  string
+		wantWarning string
+	}{
+		{
+			name:        "vanilla",
+			opts:        Options{},
+			wantDetail:  "authorizes via helper public.clerk_user_id() whose body reads auth.* - convert the function body too (see Functions to review)",
+			wantWarning: "2 of 4 converted policies authorize via helper functions whose bodies read auth.* (public.clerk_user_id) - the SQL bundle rewrites policies, not function bodies; the conversion is incomplete until those functions are ported",
+		},
+		{
+			name:        "compat",
+			opts:        Options{Mode: ModeCompat},
+			wantDetail:  "authorizes via helper public.clerk_user_id() - covered by the auth.* compat shim (see Functions to review)",
+			wantWarning: "2 of 4 converted policies authorize via helper functions whose bodies read auth.* (public.clerk_user_id) - the emitted auth.* shim keeps helper calls working, but bodies touching auth tables still need porting",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := Convert(helperFixture, tc.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rep := res.Report
+			// Unqualified and qualified call sites both link to the helper.
+			for _, policy := range []string{"notes_owner", "notes_owner_write"} {
+				if got := outcomeFor(t, rep, policy).Detail; !strings.Contains(got, tc.wantDetail) {
+					t.Errorf("%s detail = %q, want it to contain %q", policy, got, tc.wantDetail)
+				}
+			}
+			// A helper without auth.* in its body must not be annotated.
+			if got := outcomeFor(t, rep, "notes_positive").Detail; got != "" {
+				t.Errorf("notes_positive detail = %q, want empty", got)
+			}
+			// auth-schema DDL in a full dump must not turn the rewriter's own
+			// auth.uid() conversions into false helper linkage.
+			if got := outcomeFor(t, rep, "notes_uid").Detail; strings.Contains(got, "authorizes via helper") {
+				t.Errorf("notes_uid detail = %q, want no helper annotation", got)
+			}
+			joined := strings.Join(rep.Warnings, "\n")
+			if !strings.Contains(joined, tc.wantWarning) {
+				t.Errorf("warnings missing %q, got %v", tc.wantWarning, rep.Warnings)
+			}
+			// Both call shapes aggregate onto one routine reference count.
+			routines := strings.Join(rep.Routines, "\n")
+			if !strings.Contains(routines, "`public.clerk_user_id`") || !strings.Contains(routines, "(referenced by 2 policies)") {
+				t.Errorf("routines missing reference count, got %v", rep.Routines)
+			}
+			if strings.Contains(routines, "is_positive") {
+				t.Errorf("is_positive should not be flagged for review, got %v", rep.Routines)
+			}
+		})
+	}
+}
+
 func TestRewriteInPlace(t *testing.T) {
 	res, err := Rewrite(fixture, Options{})
 	if err != nil {

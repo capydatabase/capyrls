@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the capyrls release version.
-const Version = "0.1.0"
+const Version = "1.1.0"
 
 // Mode selects the output convention.
 type Mode int
@@ -154,6 +154,26 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 	compatRoles := map[string]bool{}
 	rlsTables := map[string]QName{}
 
+	// Routines flagged for review, indexed for helper linkage: apps define
+	// custom helpers (e.g. clerk_user_id()) whose bodies read auth.*, then
+	// call them from policies - the policy text converts cleanly while
+	// silently depending on the unconverted helper.
+	reviewedRoutines := map[string]bool{}
+	reviewedByName := map[string][]string{}
+	for _, routine := range cat.Routines {
+		if supabaseManagedSchemas[routine.Name.EffectiveSchema()] {
+			continue
+		}
+		key := routine.Name.Key()
+		if reviewedRoutines[key] {
+			continue
+		}
+		reviewedRoutines[key] = true
+		reviewedByName[routine.Name.Name] = append(reviewedByName[routine.Name.Name], key)
+	}
+	routineRefs := map[string]int{}
+	linkedPolicies := 0
+
 	for _, t := range cat.sortedTables() {
 		if t.RLSEnabled && !supabaseManagedSchemas[t.Name.EffectiveSchema()] {
 			rlsTables[t.Name.Key()] = t.Name
@@ -216,6 +236,25 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 			rendered = splitAll(base)
 			detail = "FOR ALL split into per-command policies"
 		}
+		helpers := dedupe(append(
+			exprRoutineCalls(p.Using, reviewedRoutines, reviewedByName),
+			exprRoutineCalls(p.WithCheck, reviewedRoutines, reviewedByName)...))
+		if len(helpers) > 0 {
+			sort.Strings(helpers)
+			for _, key := range helpers {
+				routineRefs[key]++
+			}
+			linkedPolicies++
+			note := fmt.Sprintf("authorizes via helper %s whose body reads auth.* - convert the function body too (see Functions to review)", helperCallList(helpers))
+			if opts.Mode == ModeCompat {
+				note = fmt.Sprintf("authorizes via helper %s - covered by the auth.* compat shim (see Functions to review)", helperCallList(helpers))
+			}
+			if detail != "" {
+				detail += "; " + note
+			} else {
+				detail = note
+			}
+		}
 		for _, rp := range rendered {
 			policySQL.WriteString(renderPolicySQL(rp))
 			policySQL.WriteString("\n")
@@ -230,6 +269,24 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 		}
 	}
 	sortOutcomes(rep.Policies)
+
+	if linkedPolicies > 0 {
+		converted, _, _ := rep.counts()
+		linked := make([]string, 0, len(routineRefs))
+		for key := range routineRefs {
+			linked = append(linked, key)
+		}
+		sort.Strings(linked)
+		if opts.Mode == ModeCompat {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+				"%d of %d converted policies authorize via helper functions whose bodies read auth.* (%s) - the emitted auth.* shim keeps helper calls working, but bodies touching auth tables still need porting",
+				linkedPolicies, converted, strings.Join(linked, ", ")))
+		} else {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+				"%d of %d converted policies authorize via helper functions whose bodies read auth.* (%s) - the SQL bundle rewrites policies, not function bodies; the conversion is incomplete until those functions are ported",
+				linkedPolicies, converted, strings.Join(linked, ", ")))
+		}
+	}
 
 	// Column defaults referencing auth.* become explicit ALTERs.
 	var defaultsSQL strings.Builder
@@ -250,7 +307,13 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 	}
 
 	for _, routine := range cat.Routines {
-		rep.Routines = append(rep.Routines, fmt.Sprintf("`%s` (%s)", routine.Name.Key(), routine.Origin))
+		entry := fmt.Sprintf("`%s` (%s)", routine.Name.Key(), routine.Origin)
+		if n := routineRefs[routine.Name.Key()]; n == 1 {
+			entry += " (referenced by 1 policy)"
+		} else if n > 1 {
+			entry += fmt.Sprintf(" (referenced by %d policies)", n)
+		}
+		rep.Routines = append(rep.Routines, entry)
 	}
 
 	// Assemble the bundle.
@@ -448,6 +511,15 @@ func buildGUCContract(opts Options, rw *rewriter) []GUCSpec {
 		gucs = append(gucs, GUCSpec{Name: p + ".claims", Type: "json (text GUC)", Description: "full claims JSON, for deep claim paths the converter could not promote"})
 	}
 	return gucs
+}
+
+// helperCallList renders routine keys as call sites: "public.a(), public.b()".
+func helperCallList(keys []string) string {
+	calls := make([]string, len(keys))
+	for i, key := range keys {
+		calls[i] = key + "()"
+	}
+	return strings.Join(calls, ", ")
 }
 
 func dedupe(in []string) []string {

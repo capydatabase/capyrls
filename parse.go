@@ -638,3 +638,42 @@ func tokensReferenceAuth(toks []token) bool {
 func exprReferencesAuth(expr string) bool {
 	return tokensReferenceAuth(lexSQL(expr))
 }
+
+// exprRoutineCalls returns the Key()s of reviewed routines that expr calls,
+// matching qualified (public.clerk_user_id()) and unqualified
+// (clerk_user_id()) call sites. Unqualified calls match by bare name, since
+// resolution depends on the runtime search_path.
+func exprRoutineCalls(expr string, byKey map[string]bool, byName map[string][]string) []string {
+	toks := lexSQL(expr)
+	seen := map[string]bool{}
+	var out []string
+	for i := range toks {
+		t := toks[i]
+		if t.Kind != tIdent && t.Kind != tQIdent {
+			continue
+		}
+		open := nextSig(toks, i+1)
+		if open == len(toks) || toks[open].Kind != tOp || toks[open].Text != "(" {
+			continue
+		}
+		var keys []string
+		if p := prevSig(toks, i); p >= 0 && toks[p].Kind == tOp && toks[p].Text == "." {
+			pp := prevSig(toks, p)
+			if pp < 0 || toks[pp].Kind != tIdent && toks[pp].Kind != tQIdent {
+				continue
+			}
+			if key := (QName{Schema: toks[pp].Val, Name: t.Val}).Key(); byKey[key] {
+				keys = []string{key}
+			}
+		} else {
+			keys = byName[t.Val]
+		}
+		for _, key := range keys {
+			if !seen[key] {
+				seen[key] = true
+				out = append(out, key)
+			}
+		}
+	}
+	return out
+}
