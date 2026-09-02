@@ -1,6 +1,6 @@
-module github.com/capy-base/capyrls
+module github.com/capydatabase/capyrls
 
-go 1.27.0
+go 1.27.1
 
 require github.com/jackc/pgx/v5 v5.10.0
 

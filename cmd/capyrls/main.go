@@ -1,5 +1,5 @@
 // capyrls converts Supabase row-level-security policies to portable, vanilla
-// PostgreSQL. See https://github.com/capy-base/capyrls.
+// PostgreSQL. See https://github.com/capydatabase/capyrls.
 package main
 
 import (
@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	capyrls "github.com/capy-base/capyrls"
-	"github.com/capy-base/capyrls/live"
+	capyrls "github.com/capydatabase/capyrls"
+	"github.com/capydatabase/capyrls/live"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // database/sql driver for --db
 )

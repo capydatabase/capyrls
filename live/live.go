@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"strings"
 
-	capyrls "github.com/capy-base/capyrls"
+	capyrls "github.com/capydatabase/capyrls"
 )
 
 // authRefPattern matches expressions that call the Supabase auth helpers.

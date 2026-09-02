@@ -105,18 +105,18 @@ rewrites `auth.*` calls in place (byte-identical everywhere else), keeps your
 The converter is an importable, dependency-free Go library:
 
 ```go
-import "github.com/capy-base/capyrls"
+import "github.com/capydatabase/capyrls"
 
 result, err := capyrls.Convert(sources, capyrls.Options{})
 ```
 
-Live introspection lives in `github.com/capy-base/capyrls/live` and takes any
+Live introspection lives in `github.com/capydatabase/capyrls/live` and takes any
 `*sql.DB`.
 
 ## Install
 
 ```bash
-go install github.com/capy-base/capyrls/cmd/capyrls@latest
+go install github.com/capydatabase/capyrls/cmd/capyrls@latest
 ```
 
 Or grab a release binary. CapyDB users get the same converter as
