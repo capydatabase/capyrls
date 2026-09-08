@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The Go module path is now `github.com/capydatabase/capyrls`. Update imports of the library package and the `live` subpackage, and install the CLI with `go install github.com/capydatabase/capyrls/cmd/capyrls@latest`. ([4836ec6](https://github.com/capy-base/capyrls/commit/4836ec6))
+- The Go module path is now `github.com/capydatabase/capyrls`. Update imports of the library package and the `live` subpackage, and install the CLI with `go install github.com/capydatabase/capyrls/cmd/capyrls@latest`. ([4836ec6](https://github.com/capydatabase/capyrls/commit/4836ec6))
 
 ## [1.1.0] - 2026-09-01
 
@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Importable, dependency-free Go library (`capyrls` package) and `live`
   subpackage for `*sql.DB` introspection.
 
-[Unreleased]: https://github.com/capy-base/capyrls/compare/v1.2.0...HEAD
-[1.2.0]: https://github.com/capy-base/capyrls/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/capy-base/capyrls/compare/v0.1.0...v1.1.0
-[0.1.0]: https://github.com/capy-base/capyrls/releases/tag/v0.1.0
+[Unreleased]: https://github.com/capydatabase/capyrls/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/capydatabase/capyrls/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/capydatabase/capyrls/compare/v0.1.0...v1.1.0
+[0.1.0]: https://github.com/capydatabase/capyrls/releases/tag/v0.1.0
