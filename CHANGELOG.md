@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`supabase-compat` with the single role model no longer needs `CREATE ROLE`.** It previously kept
+  `TO anon` / `TO authenticated` / `TO service_role` as literal role targets and emitted
+  `create role ...` stubs plus membership grants. A managed-Postgres owning credential has neither
+  `SUPERUSER` nor `CREATEROLE`, so that bundle could not be applied by the customer it was written
+  for. Those targets now become predicates on `auth.role()`, the way the vanilla mode already
+  handled them. The split role model is unchanged: it creates the roles itself, so keeping the
+  vocabulary there is both possible and more faithful.
+
+  This is also more accurate than what it replaced. Membership grants made the runtime role a member
+  of both `anon` and `authenticated`, so an anon-only policy applied to authenticated sessions too;
+  a predicate distinguishes them.
+
+- **The compat presence predicate tests `auth.role()`, not `auth.uid()`.** `role` is what PostgREST
+  actually switched on, and the shim defaults it to `anon` when no claims are set, so an absent
+  token reads as anon exactly as it did on Supabase. It also avoids `auth.uid()`'s `::uuid` cast,
+  which raises for providers whose subject is not a uuid (Clerk ids are `user_...`).
+
+- A `service_role`-only policy dropped under `--role-model single --no-service-escape` now reports
+  that no service path exists and the access is denied, instead of claiming the service path
+  "already bypasses RLS" — true for the other configurations, false for that one.
+
 ## [1.2.0] - 2026-09-02
 
 ### Changed

@@ -79,8 +79,15 @@ func analyzeRoles(p *Policy, opts Options, rw *rewriter) roleAnalysis {
 			p.Name, p.Table.Key(), strings.Join(dropped, ", ")))
 	}
 
-	if opts.Mode == ModeCompat {
-		// Compat keeps the Supabase role vocabulary as real NOLOGIN roles.
+	// Compat + split keeps the Supabase role vocabulary as real NOLOGIN roles:
+	// emitRolesSplit creates them and makes the runtime role a member. Under
+	// the single-role model there is nobody to create them - a managed
+	// instance's owning credential has neither SUPERUSER nor CREATEROLE - so
+	// the role targets become predicates on auth.role(), exactly as vanilla
+	// does. That is also the more faithful reading: membership grants make an
+	// anon-only policy apply to authenticated sessions too, which a predicate
+	// does not.
+	if opts.Mode == ModeCompat && opts.RoleModel == RoleSplit {
 		var targets []string
 		if hasPublic {
 			targets = nil
@@ -110,6 +117,13 @@ func analyzeRoles(p *Policy, opts Options, rw *rewriter) roleAnalysis {
 	// Vanilla: role names become predicates on the session context.
 	if hasService && !hasPublic && !hasAnon && !hasAuthed && len(custom) == 0 {
 		res.skip = "applies only to service_role; the service path (BYPASSRLS role or service escape) already bypasses RLS"
+		if opts.RoleModel == RoleSingle && opts.NoServiceEscape {
+			// Skipping is still right - there is no role to target - but saying
+			// "already bypasses RLS" would be false: this configuration has no
+			// service path at all, so the access is now denied rather than
+			// granted elsewhere.
+			res.skip = "applies only to service_role, and no service path exists (--no-service-escape): the access it granted is now denied - re-grant it explicitly if something still needs it"
+		}
 		return res
 	}
 	if len(dropped) > 0 && !hasPublic && !hasAnon && !hasAuthed && !hasService && len(custom) == 0 {
@@ -147,11 +161,20 @@ func analyzeRoles(p *Policy, opts Options, rw *rewriter) roleAnalysis {
 }
 
 func userPresenceCond(opts Options, rw *rewriter, present bool) string {
+	// Compat mode tests auth.role(), not auth.uid(): role is what PostgREST
+	// actually switched on, and the shim defaults it to 'anon' when no claims
+	// are set, so an absent token reads as anon exactly as it did on Supabase.
+	// It also avoids auth.uid()'s ::uuid cast, which raises for providers whose
+	// subject is not a uuid (Clerk's `user_...` ids).
+	if opts.Mode == ModeCompat {
+		rw.usedRole = true
+		if present {
+			return "(select auth.role()) = '" + roleAuthed + "'"
+		}
+		return "(select auth.role()) = '" + roleAnon + "'"
+	}
 	rw.usedUser = true
 	call := "(select " + opts.Prefix + ".user_id())"
-	if opts.Mode == ModeCompat {
-		call = "(select auth.uid())"
-	}
 	if present {
 		return call + " is not null"
 	}
@@ -284,7 +307,9 @@ func emitPrelude(opts Options, rw *rewriter) string {
 --   commit;
 --
 -- Unset claims read as an empty object, so auth.uid() is NULL and policies
--- fail closed.
+-- keyed on identity fail closed. auth.role() falls back to 'anon', which is
+-- what TO anon policies were written against, so those still apply to a
+-- caller with no token - exactly as on Supabase.
 
 create schema if not exists auth;
 

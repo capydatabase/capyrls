@@ -272,6 +272,63 @@ func TestConvertCompatMode(t *testing.T) {
 	}
 }
 
+// Compat + single role is the managed-Postgres shape: the app connects as the
+// owning credential, which on a managed instance has neither SUPERUSER nor
+// CREATEROLE. The bundle must therefore create no roles at all, and express
+// `TO anon` / `TO authenticated` as predicates instead.
+func TestConvertCompatSingleRoleNeedsNoRoles(t *testing.T) {
+	anonSource := append(append([]Source{}, fixture...), Source{Name: "0003_anon.sql", SQL: `
+create policy anon_browse on public.todos
+  for select to anon using (not archived);
+`})
+	res, err := Convert(anonSource, Options{
+		Mode: ModeCompat, RoleModel: RoleSingle, NoServiceEscape: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing in the bundle may need CREATE ROLE.
+	for _, f := range res.Files {
+		if strings.Contains(strings.ToLower(f.SQL), "create role") {
+			t.Errorf("%s emits CREATE ROLE; compat+single must not need role creation", f.Name)
+		}
+	}
+
+	policies := findFile(t, res, "capyrls_03_policies.sql")
+	for _, want := range []string{
+		"(select auth.role()) = 'authenticated'",
+		"(select auth.role()) = 'anon'",
+	} {
+		if !strings.Contains(policies, want) {
+			t.Errorf("compat+single policies missing predicate %q", want)
+		}
+	}
+	for _, unwanted := range []string{"to authenticated", "to anon", "to service_role"} {
+		if strings.Contains(policies, unwanted) {
+			t.Errorf("compat+single policies still carry a role target %q", unwanted)
+		}
+	}
+	// auth.uid() casts to uuid; the presence predicate must not depend on it,
+	// or it raises for providers whose subject is not a uuid (Clerk).
+	if strings.Contains(policies, "(select auth.uid()) is not null") {
+		t.Error("presence predicate must test auth.role(), not auth.uid()")
+	}
+
+	// FORCE is what makes the policies apply to the owning credential at all.
+	force := findFile(t, res, "capyrls_02_force_rls.sql")
+	if !strings.Contains(force, "alter table public.todos force row level security;") {
+		t.Error("compat+single must FORCE row level security")
+	}
+
+	// With no service path, a service_role-only policy is not "covered
+	// elsewhere" - the access it granted is gone, and the report must say so.
+	skipped := outcomeFor(t, res.Report, "admin_all")
+	if skipped.Status != "skipped" || !strings.Contains(skipped.Detail, "no service path exists") {
+		t.Errorf("service-only policy outcome = %+v; want a skip naming the absent service path", skipped)
+	}
+}
+
 func TestConvertNoSplitAll(t *testing.T) {
 	res, err := Convert(fixture, Options{NoSplitAll: true})
 	if err != nil {
