@@ -158,8 +158,16 @@ func isAuthHelper(name string) bool {
 // returns the last token index it consumed.
 func (rw *rewriter) replaceHelper(toks []token, helper string, closeIdx int, wrap bool) (string, int) {
 	if rw.dialect == dialectCompat {
-		core := "auth." + helper + "()"
-		return wrapCall(core, wrap), closeIdx
+		// Deliberately ignores `wrap`. Compat is the fidelity mode - the call is
+		// emitted as written. Wrapping it as `(select auth.uid())` sets the
+		// policy's hasSubLinks flag, and Postgres's static recursion check then
+		// rejects any policy that reaches this table through it; the common case
+		// is an INSERT whose WITH CHECK looks for a prior row, which fails with
+		// "infinite recursion detected in policy". Verified on postgres:17, both
+		// for this call site and for the role predicate in emit.go. A source
+		// policy that wanted the initplan already spells it that way, and that
+		// text is preserved verbatim.
+		return "auth." + helper + "()", closeIdx
 	}
 
 	p := rw.prefix

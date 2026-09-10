@@ -42,15 +42,20 @@ type renderedPolicy struct {
 }
 
 type roleAnalysis struct {
-	cond     string   // extra predicate ANDed into the policy expressions
-	targets  []string // TO list for the emitted policy; empty = PUBLIC
-	skip     string   // non-empty: skip the policy for this reason
-	warnings []string
+	cond    string   // extra predicate ANDed into the policy expressions
+	targets []string // TO list for the emitted policy; empty = PUBLIC
+	skip    string   // non-empty: skip the policy for this reason
+	// skippedServiceOnly marks the one skip reason that removes real access
+	// rather than being covered elsewhere: a service_role-only policy under a
+	// configuration with no service path. The caller emits a commented stub so
+	// the operator has to delete it rather than discover the gap in production.
+	skippedServiceOnly bool
+	warnings           []string
 	// compat mode: which Supabase pseudo-roles must exist as real roles
 	needsRoles []string
 }
 
-func analyzeRoles(p *Policy, opts Options, rw *rewriter) roleAnalysis {
+func analyzeRoles(p *Policy, opts Options, rw *rewriter, selfRef bool) roleAnalysis {
 	var res roleAnalysis
 	var custom []string
 	var dropped []string
@@ -123,6 +128,7 @@ func analyzeRoles(p *Policy, opts Options, rw *rewriter) roleAnalysis {
 			// service path at all, so the access is now denied rather than
 			// granted elsewhere.
 			res.skip = "applies only to service_role, and no service path exists (--no-service-escape): the access it granted is now denied - re-grant it explicitly if something still needs it"
+			res.skippedServiceOnly = true
 		}
 		return res
 	}
@@ -135,9 +141,9 @@ func analyzeRoles(p *Policy, opts Options, rw *rewriter) roleAnalysis {
 	case hasPublic, hasAnon && hasAuthed:
 		res.cond = ""
 	case hasAuthed:
-		res.cond = userPresenceCond(opts, rw, true)
+		res.cond = userPresenceCond(opts, rw, true, selfRef)
 	case hasAnon:
-		res.cond = userPresenceCond(opts, rw, false)
+		res.cond = userPresenceCond(opts, rw, false, selfRef)
 	}
 
 	if len(custom) > 0 {
@@ -160,21 +166,58 @@ func analyzeRoles(p *Policy, opts Options, rw *rewriter) roleAnalysis {
 	return res
 }
 
-func userPresenceCond(opts Options, rw *rewriter, present bool) string {
+// expressionReferencesTable reports whether a policy expression names its own
+// table. Lexed rather than pattern-matched so a table name inside a string
+// literal does not count.
+//
+// Used to decide whether the initplan `(select ...)` wrap is safe: a sublink
+// sets the policy's hasSubLinks flag, and Postgres's static RLS recursion check
+// then rejects any policy that reaches the same table through it. When the
+// policy touches its own table we give up the optimisation rather than the
+// policy. False positives (a column that shares the table's name) cost only
+// that optimisation, which is the safe direction to be wrong in.
+func expressionReferencesTable(expr string, table QName) bool {
+	if strings.TrimSpace(expr) == "" {
+		return false
+	}
+	name := strings.ToLower(table.Name)
+	for _, tok := range lexSQL(expr) {
+		if tok.Kind == tIdent && tok.Val == name {
+			return true
+		}
+	}
+	return false
+}
+
+func userPresenceCond(opts Options, rw *rewriter, present, selfRef bool) string {
 	// Compat mode tests auth.role(), not auth.uid(): role is what PostgREST
 	// actually switched on, and the shim defaults it to 'anon' when no claims
 	// are set, so an absent token reads as anon exactly as it did on Supabase.
 	// It also avoids auth.uid()'s ::uuid cast, which raises for providers whose
 	// subject is not a uuid (Clerk's `user_...` ids).
+	// NOT wrapped in `(select ...)`. The initplan form is the usual RLS
+	// performance trick, but it sets the policy's hasSubLinks flag, and
+	// Postgres's static recursion check then rejects any policy that reaches
+	// the same table through this one - e.g. an INSERT whose WITH CHECK looks
+	// for a prior row, which is legitimate and common. Verified on postgres:17:
+	// with the sublink the insert fails `infinite recursion detected in policy
+	// for relation "messages"`; without it the same policy set works and still
+	// denies anon. auth.role() only reads a GUC, so the per-row cost this gives
+	// up is negligible - correctness wins.
 	if opts.Mode == ModeCompat {
 		rw.usedRole = true
 		if present {
-			return "(select auth.role()) = '" + roleAuthed + "'"
+			return "auth.role() = '" + roleAuthed + "'"
 		}
-		return "(select auth.role()) = '" + roleAnon + "'"
+		return "auth.role() = '" + roleAnon + "'"
 	}
 	rw.usedUser = true
 	call := "(select " + opts.Prefix + ".user_id())"
+	if selfRef {
+		// Same reasoning as the compat branch above: this policy reaches its
+		// own table, so a sublink here would make Postgres reject it outright.
+		call = opts.Prefix + ".user_id()"
+	}
 	if present {
 		return call + " is not null"
 	}
@@ -252,6 +295,26 @@ func renderPolicySQL(p renderedPolicy) string {
 }
 
 // renderOriginalPolicy reconstructs the source policy for comment blocks.
+// renderSystemStub renders the policy a service_role-only policy would become
+// if its access is still needed: same table and command, gated on the caller
+// having stated a system context rather than on a bypass. Emitted commented
+// out - it is a starting point for the operator, not a decision capyrls makes.
+func renderSystemStub(p *Policy, opts Options) string {
+	gate := "auth.jwt() ->> 'app_role' = 'system'"
+	if opts.Mode != ModeCompat {
+		gate = "(select " + opts.Prefix + ".role()) = 'service'"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "create policy %s on %s", QuoteIdent(p.Name+"_system"), p.Table)
+	fmt.Fprintf(&b, " for %s", strings.ToLower(string(p.Cmd)))
+	fmt.Fprintf(&b, " using (%s)", gate)
+	if p.Cmd == CmdAll || p.Cmd == CmdInsert || p.Cmd == CmdUpdate {
+		fmt.Fprintf(&b, " with check (%s)", gate)
+	}
+	b.WriteString(";")
+	return b.String()
+}
+
 func renderOriginalPolicy(p *Policy) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "create policy %s on %s", QuoteIdent(p.Name), p.Table)
@@ -476,11 +539,18 @@ func emitSingleRole(opts Options, tables []QName, compatRoles []string) string {
 -- convenience, not new exposure. Remove it if you split roles later.
 `, p)
 		for _, t := range tables {
+			// NOT wrapped in `(select ...)`. This policy sits on the same table as
+			// the app's own, and a sublink in ANY policy on a table is enough for
+			// Postgres's static recursion check to reject a sibling policy that
+			// reaches that table - verified on postgres:17, where adding this
+			// escape turned a working insert into "infinite recursion detected in
+			// policy". is_service() only reads a GUC, so the initplan bought
+			// almost nothing and cost correctness for the whole table.
 			fmt.Fprintf(&b, `drop policy if exists capyrls_service_escape on %s;
 create policy capyrls_service_escape on %s
   for all
-  using ((select %s.is_service()))
-  with check ((select %s.is_service()));
+  using (%s.is_service())
+  with check (%s.is_service());
 `, t, t, p, p)
 		}
 	}

@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Vanilla mode no longer emits initplan sublinks on a table that carries a self-referencing
+  policy.** Compat lost the wrap entirely in the change below; vanilla keeps it — it is a real
+  per-row optimisation — but gives it up where it is unsafe. The check is **table-scoped, not
+  policy-scoped**: Postgres rejects a policy that reaches table T if *any* policy on T carries a
+  sublink, so cleaning only the self-referencing policy is not enough. Verified on postgres:17: an
+  innocent sibling `SELECT` policy's initplan still produced `infinite recursion detected in policy`
+  until every policy on the table was emitted sublink-free.
+
+  The generated `capyrls_service_escape` policy is no longer wrapped either, for the same reason —
+  it sits on the same tables. `is_service()` only reads a GUC, so the initplan bought almost nothing
+  there and cost correctness for the whole table.
+
+  End to end on postgres:17 with a non-superuser owner under `FORCE ROW LEVEL SECURITY`: a
+  self-referencing `INSERT` that previously failed with `infinite recursion detected in policy` now
+  succeeds, isolation still holds (a user sees only their own rows), and anon sees nothing.
+
+### Added
+
+- **Skipped `service_role`-only policies now leave a commented stub in the bundle.** They were listed
+  in the report and nowhere else, so the access they granted simply vanished — on myroomiev3 that
+  silently denied the compatibility-score cron's write path, found in production. The bundle now
+  carries the original policy and a `system`-gated replacement, both commented out, so the operator
+  deletes them deliberately instead of discovering the gap later.
+
+### Fixed
+
+- **`supabase-compat` no longer emits initplan sublinks, which broke self-referencing policies.**
+  Both the role predicate (`(select auth.role()) = 'authenticated'`) and every rewritten auth call
+  in a policy's own expression (`(select auth.uid())`) were wrapped as scalar subqueries. That sets
+  the policy's `hasSubLinks` flag, and Postgres's static RLS recursion check then rejects any policy
+  that reaches the same table through it — the common trigger being an `INSERT` whose `WITH CHECK`
+  looks for a prior row, which fails with `infinite recursion detected in policy for relation ...`.
+
+  Both sites now emit the plain call. Verified on postgres:17 with a non-superuser owner under
+  `FORCE ROW LEVEL SECURITY`: wrapped fails, unwrapped inserts correctly and still denies anon.
+  The initplan is a per-row-cost optimisation for expensive predicates; these read a GUC, so what it
+  bought was negligible and what it cost was a whole class of working policy sets. A source policy
+  that wants the initplan already spells it that way, and compat preserves that text verbatim.
+
+  Vanilla mode still wraps (`(select app.user_id())`) and carries the same hazard for corpora with
+  self-referencing policies — tracked separately; it rewrites policy text anyway, so the fidelity
+  argument that settles compat does not apply there.
+
 ## [1.11.1] - 2026-09-09
 
 ### Changed

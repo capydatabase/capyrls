@@ -205,7 +205,9 @@ func TestConvertSingleRoleServiceEscape(t *testing.T) {
 		"alter table public.profiles force row level security;",
 		"alter table public.todos force row level security;",
 		"create policy capyrls_service_escape on public.todos",
-		"(select app.is_service())",
+		// Unwrapped: a sublink in ANY policy on a table makes Postgres reject a
+		// sibling policy that reaches that table.
+		"using (app.is_service())",
 	} {
 		if !strings.Contains(force, want) {
 			t.Errorf("force file missing %q", want)
@@ -244,7 +246,8 @@ func TestConvertCompatMode(t *testing.T) {
 	}
 	policies := findFile(t, res, "capyrls_03_policies.sql")
 	for _, want := range []string{
-		"(select auth.uid()) = id",
+		// Verbatim and unwrapped - see TestRewriteCompatKeepsAuthCallsVerbatim.
+		"auth.uid() = id",
 		"to authenticated",
 		"to service_role",
 	} {
@@ -297,15 +300,24 @@ create policy anon_browse on public.todos
 
 	policies := findFile(t, res, "capyrls_03_policies.sql")
 	for _, want := range []string{
-		"(select auth.role()) = 'authenticated'",
-		"(select auth.role()) = 'anon'",
+		"auth.role() = 'authenticated'",
+		"auth.role() = 'anon'",
 	} {
 		if !strings.Contains(policies, want) {
 			t.Errorf("compat+single policies missing predicate %q", want)
 		}
 	}
+	// Only live SQL counts: the bundle deliberately quotes skipped originals
+	// (which do carry `to service_role`) inside comments.
+	var live strings.Builder
+	for _, line := range strings.Split(policies, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
+			live.WriteString(line)
+			live.WriteString("\n")
+		}
+	}
 	for _, unwanted := range []string{"to authenticated", "to anon", "to service_role"} {
-		if strings.Contains(policies, unwanted) {
+		if strings.Contains(live.String(), unwanted) {
 			t.Errorf("compat+single policies still carry a role target %q", unwanted)
 		}
 	}
@@ -313,6 +325,13 @@ create policy anon_browse on public.todos
 	// or it raises for providers whose subject is not a uuid (Clerk).
 	if strings.Contains(policies, "(select auth.uid()) is not null") {
 		t.Error("presence predicate must test auth.role(), not auth.uid()")
+	}
+	// The initplan form sets hasSubLinks, and Postgres's static recursion check
+	// then rejects any policy reaching this table through it - an INSERT whose
+	// WITH CHECK looks for a prior row fails with "infinite recursion detected
+	// in policy". Reproduced on postgres:17; the plain call works.
+	if strings.Contains(policies, "(select auth.role())") {
+		t.Error("compat role predicate must not be wrapped in (select ...): the sublink breaks self-referencing policies")
 	}
 
 	// FORCE is what makes the policies apply to the owning credential at all.
@@ -495,5 +514,59 @@ func TestConvertDeterministic(t *testing.T) {
 		if a.Files[i].SQL != b.Files[i].SQL {
 			t.Fatalf("output for %s is not deterministic", a.Files[i].Name)
 		}
+	}
+}
+
+// Vanilla mode keeps the initplan wrap - a real per-row optimisation - except
+// on a TABLE that carries a self-referencing policy, where a sublink in any
+// policy makes Postgres reject the one that reaches the table.
+func TestConvertVanillaDropsInitplanOnSelfReferencingTable(t *testing.T) {
+	source := []Source{{Name: "0001.sql", SQL: `
+create table public.threads (id bigint primary key, owner_id uuid, parent_id bigint);
+create table public.notes (id bigint primary key, owner_id uuid);
+alter table public.threads enable row level security;
+alter table public.notes enable row level security;
+
+-- threads: one policy reaches its own table...
+create policy threads_reply on public.threads
+  for insert to authenticated
+  with check (auth.uid() = owner_id
+              and exists (select 1 from threads prior where prior.id = parent_id));
+
+-- ...so this sibling must lose the wrap too, even though it is innocent:
+-- a sublink in ANY policy on the table triggers the recursion check.
+create policy threads_own on public.threads
+  for select to authenticated using (auth.uid() = owner_id);
+
+-- notes touches nothing else: the optimisation is safe and must survive.
+create policy notes_own on public.notes
+  for select to authenticated using (auth.uid() = owner_id);
+`}}
+	res, err := Convert(source, Options{RoleModel: RoleSingle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policies := findFile(t, res, "capyrls_03_policies.sql")
+
+	inThreads := false
+	for _, line := range strings.Split(policies, "\n") {
+		if strings.Contains(line, "on public.threads") {
+			inThreads = true
+		} else if strings.Contains(line, "on public.notes") {
+			inThreads = false
+		}
+		if inThreads && strings.Contains(line, "(select app.") {
+			t.Errorf("no policy on a self-referencing table may carry a sublink: %s", strings.TrimSpace(line))
+		}
+	}
+	if !strings.Contains(policies, "(select app.user_id()) = owner_id") {
+		t.Error("a table with no self-referencing policy must keep the initplan wrap")
+	}
+
+	// The generated escape policy sits on those tables too, so it is never
+	// wrapped either.
+	force := findFile(t, res, "capyrls_02_force_rls.sql")
+	if strings.Contains(force, "(select app.is_service())") {
+		t.Error("the service escape must not carry a sublink - it shares the table")
 	}
 }

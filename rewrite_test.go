@@ -52,11 +52,15 @@ func TestRewriteAuthUsersIsBlocker(t *testing.T) {
 	}
 }
 
-func TestRewriteCompatKeepsAuthCalls(t *testing.T) {
+func TestRewriteCompatKeepsAuthCallsVerbatim(t *testing.T) {
 	rw := newRewriter(dialectCompat, "app")
 	out := rw.rewriteExpr(`auth.uid() = user_id`, true)
-	if out.SQL != `(select auth.uid()) = user_id` {
-		t.Fatalf("compat should keep auth.uid() and only wrap it, got %q", out.SQL)
+	// Verbatim, and specifically NOT wrapped as `(select auth.uid())`: the
+	// sublink sets hasSubLinks, which makes Postgres reject any policy reaching
+	// this table through it ("infinite recursion detected in policy"). An INSERT
+	// whose WITH CHECK looks for a prior row is the common trigger.
+	if out.SQL != `auth.uid() = user_id` {
+		t.Fatalf("compat must emit the call verbatim and unwrapped, got %q", out.SQL)
 	}
 }
 

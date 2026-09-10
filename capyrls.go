@@ -149,6 +149,22 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 		return policies[i].Name < policies[j].Name
 	})
 
+	// Which TABLES carry a self-referencing policy. The hazard is per-table,
+	// not per-policy: Postgres's static recursion check rejects a policy that
+	// reaches table T if ANY policy on T carries a sublink, so cleaning only
+	// the self-referencing policy is not enough - verified on postgres:17,
+	// where a sibling SELECT policy's initplan still broke the insert. When a
+	// table is in this set, every policy on it is emitted sublink-free.
+	selfRefTables := map[string]bool{}
+	for _, p := range policies {
+		if supabaseManagedSchemas[p.Table.EffectiveSchema()] {
+			continue
+		}
+		if expressionReferencesTable(p.Using, p.Table) || expressionReferencesTable(p.WithCheck, p.Table) {
+			selfRefTables[p.Table.Key()] = true
+		}
+	}
+
 	var policySQL strings.Builder
 	var blockedSQL strings.Builder
 	compatRoles := map[string]bool{}
@@ -190,20 +206,38 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 			continue
 		}
 
-		analysis := analyzeRoles(p, opts, rw)
+		// Table-scoped: one self-referencing policy disarms the initplan for
+		// every policy on that table, including this one's role predicate and
+		// its rewritten auth calls.
+		selfRef := selfRefTables[p.Table.Key()]
+		analysis := analyzeRoles(p, opts, rw, selfRef)
 		rep.Warnings = append(rep.Warnings, analysis.warnings...)
 		for _, role := range analysis.needsRoles {
 			compatRoles[role] = true
 		}
 		if analysis.skip != "" {
+			// A service_role-only policy under a no-service-path configuration is
+			// the one skip that removes access instead of relocating it. Emit the
+			// original, commented out, next to a `system` stub: the operator has
+			// to delete it deliberately rather than find the gap when a cron job
+			// silently writes nothing.
+			if analysis.skippedServiceOnly {
+				policySQL.WriteString(commentOut(fmt.Sprintf(
+					"SKIPPED: %s\nOriginal:\n%s\nRe-grant explicitly if something still needs this path, e.g.:\n%s",
+					analysis.skip,
+					renderOriginalPolicy(p),
+					renderSystemStub(p, opts),
+				)))
+				policySQL.WriteString("\n")
+			}
 			rep.Policies = append(rep.Policies, PolicyOutcome{
 				Policy: p.Name, Table: p.Table.Key(), Status: "skipped", Detail: analysis.skip,
 			})
 			continue
 		}
 
-		usingOutcome := rw.rewriteExpr(p.Using, true)
-		checkOutcome := rw.rewriteExpr(p.WithCheck, true)
+		usingOutcome := rw.rewriteExpr(p.Using, !selfRef)
+		checkOutcome := rw.rewriteExpr(p.WithCheck, !selfRef)
 		blockers := append(usingOutcome.Blockers, checkOutcome.Blockers...)
 		if len(blockers) > 0 {
 			detail := strings.Join(dedupe(blockers), "; ")
