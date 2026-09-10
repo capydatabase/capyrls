@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-09-10
+
 ### Fixed
 
 - **Vanilla mode no longer emits initplan sublinks on a table that carries a self-referencing
@@ -118,7 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Importable, dependency-free Go library (`capyrls` package) and `live`
   subpackage for `*sql.DB` introspection.
 
-[Unreleased]: https://github.com/capy-base/capyrls/compare/v1.11.1...HEAD
+[Unreleased]: https://github.com/capy-base/capyrls/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/capy-base/capyrls/compare/v1.11.1...v1.12.0
 [1.11.1]: https://github.com/capy-base/capyrls/compare/v1.2.0...v1.11.1
 [1.2.0]: https://github.com/capy-base/capyrls/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/capy-base/capyrls/compare/v0.1.0...v1.1.0
