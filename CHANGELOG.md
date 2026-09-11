@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The FORCE block now carries a foreign-key warning.** `FORCE ROW LEVEL SECURITY` is what makes
+  the single-role model work, but Postgres applies row security to the scan that validates a
+  **foreign key** while leaving runtime enforcement and `CHECK` validation alone — verified on
+  17.11. So once a parent is FORCEd, `ADD CONSTRAINT ... FOREIGN KEY` and `VALIDATE CONSTRAINT`
+  fail with `23503` naming rows that exist and are only invisible. Data is fine; existing keys hold
+  and every write is still checked. It is the two DDL paths that stop — which means
+  **`drizzle-kit push` adding a foreign key to an existing table hits it.**
+
+  The emitted `capyrls_02_force_rls.sql` now explains that, and carries the recipe: drop `FORCE` on
+  the **parent only**, for the length of the statement, in a `DO` block whose exception handler
+  restores it. It also states the other consequence people misread as data loss — under FORCE the
+  owner has no privileged view, so a `count(*)` is what the policies admit, not what the table
+  holds, and there is no `service_role` to fall back on. A test pins the warning so it cannot vanish
+  quietly.
+
+## [Unreleased]
+
 ## [1.12.0] - 2026-09-10
 
 ### Fixed

@@ -570,3 +570,43 @@ create policy notes_own on public.notes
 		t.Error("the service escape must not carry a sublink - it shares the table")
 	}
 }
+
+// TestForceCarriesTheForeignKeyWarning pins the note that ships beside FORCE.
+//
+// FORCE makes Postgres apply policies to the scan that validates a FOREIGN KEY,
+// while leaving runtime enforcement and CHECK validation alone (verified on
+// postgres:17.11). Adding a foreign key to a FORCEd parent therefore fails with
+// 23503 naming rows that exist and are merely invisible - which stops a routine
+// `drizzle-kit push` dead, with an error that points at the wrong thing.
+//
+// The warning is the whole mitigation, so it must not be able to vanish
+// quietly: this test is what makes deleting it a failing build rather than a
+// silent regression for whoever hits 23503 next.
+func TestForceCarriesTheForeignKeyWarning(t *testing.T) {
+	for _, opts := range []Options{
+		{RoleModel: RoleSingle},
+		{RoleModel: RoleSingle, NoServiceEscape: true},
+		{Mode: ModeCompat, RoleModel: RoleSingle, NoServiceEscape: true},
+	} {
+		res, err := Convert(fixture, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		force := findFile(t, res, "capyrls_02_force_rls.sql")
+		for _, want := range []string{
+			// Names the symptom someone will paste into a search box.
+			"23503",
+			// Says plainly that data integrity is NOT the problem.
+			"referential integrity is unaffected",
+			// The recipe, and the part that keeps the window small.
+			"no force row level security",
+			"PARENT only",
+			// The other consequence of FORCE that misreads as missing data.
+			"NO privileged view",
+		} {
+			if !strings.Contains(force, want) {
+				t.Errorf("mode=%v role=%v: force file missing %q", opts.Mode, opts.RoleModel, want)
+			}
+		}
+	}
+}

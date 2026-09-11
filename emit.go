@@ -517,6 +517,66 @@ $$;
 	return b.String()
 }
 
+// forceForeignKeyNote is emitted immediately after the FORCE block.
+//
+// FORCE has one consequence nobody expects, and it is not capyrls's doing - it
+// is an asymmetry in Postgres itself. Verified on postgres:17.11:
+//
+//	runtime FK enforcement (INSERT/UPDATE)  bypasses RLS   - correct, documented
+//	CHECK constraint validation             scans all rows - correct
+//	FOREIGN KEY validation                  APPLIES RLS    - sees a filtered parent
+//	SET row_security = off (as owner)       refused        - no escape
+//
+// So adding or validating a foreign key whose PARENT is FORCEd fails with
+// 23503, naming rows that exist and are merely invisible. It is loud, never
+// silent - but it will stop a routine migration dead, and `drizzle-kit push`
+// adding a foreign key to an existing table is exactly that migration.
+//
+// The note goes in the emitted SQL rather than the README because this is read
+// at the moment someone hits it.
+const forceForeignKeyNote = `
+-- ---------------------------------------------------------------------------
+-- Adding a foreign key later? Read this first.
+--
+-- FORCE applies policies to the owner, and Postgres applies them to the scan
+-- that validates a FOREIGN KEY too - but NOT to runtime enforcement, and NOT
+-- to CHECK validation. So this fails once the parent is FORCEd:
+--
+--   alter table child add constraint c_fk foreign key (parent_id)
+--     references parent(id);
+--   -- ERROR: 23503 ... Key is not present in table "parent"
+--
+-- The key IS present. Your policy is hiding it from the scan. Existing keys
+-- and every INSERT/UPDATE keep working - referential integrity is unaffected.
+--
+-- To add or validate one, drop FORCE on the PARENT only, for the length of the
+-- statement. The window is owner-only and brief; the child stays FORCEd.
+--
+--   do $$
+--   declare was_forced boolean;
+--   begin
+--     select relforcerowsecurity into was_forced
+--       from pg_class where oid = 'public.parent'::regclass;
+--     alter table public.parent no force row level security;
+--     alter table public.child validate constraint c_fk;   -- or ADD CONSTRAINT
+--     if was_forced then
+--       alter table public.parent force row level security;
+--     end if;
+--   exception when others then
+--     if was_forced then
+--       alter table public.parent force row level security;
+--     end if;
+--     raise;
+--   end $$;
+--
+-- One more consequence of FORCE, while you are here: as the owner you now have
+-- NO privileged view of your own tables. A count is what your policies admit,
+-- not what the table holds. There is no service_role to fall back on - that is
+-- the point of the single-role model, not a gap in it.
+-- ---------------------------------------------------------------------------
+
+`
+
 // emitSingleRole renders FORCE ROW LEVEL SECURITY (plus the optional service
 // escape) for setups where the app connects as the table owner.
 func emitSingleRole(opts Options, tables []QName, compatRoles []string) string {
@@ -530,6 +590,7 @@ func emitSingleRole(opts Options, tables []QName, compatRoles []string) string {
 	for _, t := range tables {
 		fmt.Fprintf(&b, "alter table %s force row level security;\n", t)
 	}
+	b.WriteString(forceForeignKeyNote)
 	if !opts.NoServiceEscape && opts.Mode == ModeVanilla {
 		p := opts.Prefix
 		fmt.Fprintf(&b, `
