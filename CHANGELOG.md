@@ -24,8 +24,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.13.0] - 2026-09-11
 
-## [1.13.0] - 2026-09-11
-
 ### Added
 
 - **The FORCE block now carries a foreign-key warning.** `FORCE ROW LEVEL SECURITY` is what makes
