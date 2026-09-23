@@ -310,7 +310,7 @@ create policy anon_browse on public.todos
 	// Only live SQL counts: the bundle deliberately quotes skipped originals
 	// (which do carry `to service_role`) inside comments.
 	var live strings.Builder
-	for _, line := range strings.Split(policies, "\n") {
+	for line := range strings.SplitSeq(policies, "\n") {
 		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
 			live.WriteString(line)
 			live.WriteString("\n")
@@ -549,7 +549,7 @@ create policy notes_own on public.notes
 	policies := findFile(t, res, "capyrls_03_policies.sql")
 
 	inThreads := false
-	for _, line := range strings.Split(policies, "\n") {
+	for line := range strings.SplitSeq(policies, "\n") {
 		if strings.Contains(line, "on public.threads") {
 			inThreads = true
 		} else if strings.Contains(line, "on public.notes") {
