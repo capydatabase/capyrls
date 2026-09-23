@@ -610,3 +610,22 @@ func TestForceCarriesTheForeignKeyWarning(t *testing.T) {
 		}
 	}
 }
+
+// Compat mode never emits the service escape, so under the single role model a
+// service_role-only policy has lost its access even without --no-service-escape,
+// and the report must not claim the escape still covers it.
+func TestConvertCompatSingleReportsNoServicePathWithoutTheFlag(t *testing.T) {
+	res, err := Convert(fixture, Options{Mode: ModeCompat, RoleModel: RoleSingle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	skipped := outcomeFor(t, res.Report, "admin_all")
+	if skipped.Status != "skipped" || !strings.Contains(skipped.Detail, "no service path exists") {
+		t.Errorf("service-only policy outcome = %+v; want a skip naming the absent service path", skipped)
+	}
+	for _, f := range res.Files {
+		if strings.Contains(f.SQL, ".is_service") {
+			t.Errorf("%s defines is_service, but compat mode has no service escape to gate", f.Name)
+		}
+	}
+}

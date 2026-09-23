@@ -9,12 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Compat mode with the single role model no longer claims a service escape it never emits.** A
+  `service_role`-only policy was reported as "already bypasses RLS" and the bundle defined
+  `<prefix>.is_service` and documented `<prefix>.role = 'service'` as the escape, but compat mode
+  emits no escape: that access was gone. The report now says no service path exists (as it already
+  did with `--no-service-escape`), and the escape helper and its GUC note appear only when the
+  escape is emitted (vanilla, single role model, no `--no-service-escape`).
 - **README no longer calls compat mode zero-risk or promises the bundle runs on CapyDB as-is.**
   It now states the two limits of `--mode supabase-compat`: with the default split role model it
   recreates `anon`/`authenticated`/`service_role` with `CREATE ROLE`, which needs `CREATEROLE` that
   a managed database role (CapyDB's included) does not have; and it never emits the service
   escape, so under `--role-model single` nothing bypasses the policies. The role-model section
   notes what the split model needs to apply, and that the service escape is vanilla-only.
+
+## [1.13.0] - 2026-09-11
 
 ## [1.13.0] - 2026-09-11
 
@@ -34,8 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owner has no privileged view, so a `count(*)` is what the policies admit, not what the table
   holds, and there is no `service_role` to fall back on. A test pins the warning so it cannot vanish
   quietly.
-
-## [Unreleased]
 
 ## [1.12.0] - 2026-09-10
 

@@ -528,9 +528,9 @@ func buildGUCContract(opts Options, rw *rewriter) []GUCSpec {
 		Name: p + ".user_id", Type: "uuid (text GUC)",
 		Description: "the authenticated user's id (was `auth.uid()`)",
 	}}
-	if rw.usedRole || opts.RoleModel == RoleSingle && !opts.NoServiceEscape {
+	if rw.usedRole || emitsServiceEscape(opts) {
 		desc := "the caller's access class (was `auth.role()`)"
-		if opts.RoleModel == RoleSingle && !opts.NoServiceEscape {
+		if emitsServiceEscape(opts) {
 			desc += "; `service` activates the service escape"
 		}
 		gucs = append(gucs, GUCSpec{Name: p + ".role", Type: "text", Description: desc})
@@ -566,4 +566,12 @@ func dedupe(in []string) []string {
 		}
 	}
 	return out
+}
+
+// emitsServiceEscape reports whether the output carries the GUC-gated service
+// escape, the single role model's only service path. It is emitted in vanilla
+// mode unless --no-service-escape; compat mode never emits it, so a report or
+// helper that assumes the escape exists there describes access that is gone.
+func emitsServiceEscape(opts Options) bool {
+	return opts.RoleModel == RoleSingle && opts.Mode == ModeVanilla && !opts.NoServiceEscape
 }

@@ -122,12 +122,13 @@ func analyzeRoles(p *Policy, opts Options, rw *rewriter, selfRef bool) roleAnaly
 	// Vanilla: role names become predicates on the session context.
 	if hasService && !hasPublic && !hasAnon && !hasAuthed && len(custom) == 0 {
 		res.skip = "applies only to service_role; the service path (BYPASSRLS role or service escape) already bypasses RLS"
-		if opts.RoleModel == RoleSingle && opts.NoServiceEscape {
+		if opts.RoleModel == RoleSingle && !emitsServiceEscape(opts) {
 			// Skipping is still right - there is no role to target - but saying
 			// "already bypasses RLS" would be false: this configuration has no
-			// service path at all, so the access is now denied rather than
-			// granted elsewhere.
-			res.skip = "applies only to service_role, and no service path exists (--no-service-escape): the access it granted is now denied - re-grant it explicitly if something still needs it"
+			// service path at all (--no-service-escape, or compat mode, which never
+			// emits the escape), so the access is now denied rather than granted
+			// elsewhere.
+			res.skip = "applies only to service_role, and no service path exists (single role model without the service escape): the access it granted is now denied - re-grant it explicitly if something still needs it"
 			res.skippedServiceOnly = true
 		}
 		return res
@@ -410,12 +411,12 @@ create schema if not exists %s;
 		p+".user_id", "uuid",
 		fmt.Sprintf("select nullif(current_setting('%s.user_id', true), '')::uuid", p))
 
-	if rw.usedRole || opts.RoleModel == RoleSingle && !opts.NoServiceEscape {
+	if rw.usedRole || emitsServiceEscape(opts) {
 		writeSQLFunction(&b, "The caller's access class (was auth.role()).",
 			p+".role", "text",
 			fmt.Sprintf("select nullif(current_setting('%s.role', true), '')", p))
 	}
-	if opts.RoleModel == RoleSingle && !opts.NoServiceEscape {
+	if emitsServiceEscape(opts) {
 		writeSQLFunction(&b, fmt.Sprintf("True when the app declared this transaction a service context (%s.role = 'service').", p),
 			p+".is_service", "boolean",
 			fmt.Sprintf("select coalesce(current_setting('%s.role', true) = 'service', false)", p))
