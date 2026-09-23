@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **README no longer calls compat mode zero-risk or promises the bundle runs on CapyDB as-is.**
+  It now states the two limits of `--mode supabase-compat`: with the default split role model it
+  recreates `anon`/`authenticated`/`service_role` with `CREATE ROLE`, which needs `CREATEROLE` that
+  a managed database role (CapyDB's included) does not have; and it never emits the service
+  escape, so under `--role-model single` nothing bypasses the policies. The role-model section
+  notes what the split model needs to apply, and that the service escape is vanilla-only.
+
 ## [1.13.0] - 2026-09-11
 
 ### Added
