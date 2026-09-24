@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-09-24
+
 ### Fixed
 
 - **Compat mode with the single role model no longer claims a service escape it never emits.** A
@@ -154,7 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Importable, dependency-free Go library (`capyrls` package) and `live`
   subpackage for `*sql.DB` introspection.
 
-[Unreleased]: https://github.com/capydatabase/capyrls/compare/v1.12.0...HEAD
+[Unreleased]: https://github.com/capydatabase/capyrls/compare/v1.13.1...HEAD
+[1.13.1]: https://github.com/capydatabase/capyrls/compare/v1.13.0...v1.13.1
+[1.13.0]: https://github.com/capydatabase/capyrls/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/capydatabase/capyrls/compare/v1.11.1...v1.12.0
 [1.11.1]: https://github.com/capydatabase/capyrls/compare/v1.2.0...v1.11.1
 [1.2.0]: https://github.com/capydatabase/capyrls/compare/v1.1.0...v1.2.0
