@@ -22,6 +22,22 @@ jobs:
       - run: go build ./...
       - run: go test -race ./...
 
+  # The browser build (cmd/capyrls-wasm) only compiles for js/wasm, so the
+  # matrix above never sees it. Its tests run under Node via go_js_wasm_exec.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: GOOS=js GOARCH=wasm go build -trimpath -ldflags='-s -w' -o capyrls.wasm ./cmd/capyrls-wasm
+      - run: ls -l capyrls.wasm
+      - run: PATH="$(go env GOROOT)/lib/wasm:$PATH" GOOS=js GOARCH=wasm go test ./cmd/capyrls-wasm
+
   lint:
     runs-on: ubuntu-latest
     steps:
