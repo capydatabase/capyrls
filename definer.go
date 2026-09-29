@@ -207,6 +207,15 @@ func definerFix(opts Options) string {
 		"caller's own policies do not admit (the cross-user write that is usually why a function is " +
 		"SECURITY DEFINER) now fails with 42501, or disappears into an `exception when others` handler."
 
+	if opts.splitOnCapyDB() {
+		return lead + " These tables were already FORCEd in your source. On CapyDB the owner is the split model's " +
+			"service path, and no BYPASSRLS role exists or can be created to hand the functions to. Drop FORCE " +
+			"on the tables they write to: the functions run as the owner, which bypasses row security on tables " +
+			"that are not FORCEd, while " + opts.AppRole + " - which owns nothing - stays under the policies:\n\n" +
+			"```sql\nalter table <schema>.<table> no force row level security;\n```\n\n" +
+			"Keep FORCE only where the owner itself must be confined, and keep those functions' writes inside " +
+			"what the caller's policies admit."
+	}
 	if opts.RoleModel == RoleSplit {
 		return lead + fmt.Sprintf(" These tables were already FORCEd in your source. Hand the functions "+
 			"to the BYPASSRLS service role the bundle creates, which skips policies as the old owner did:\n\n"+

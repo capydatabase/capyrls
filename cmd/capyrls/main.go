@@ -33,7 +33,8 @@ Usage:
 
 Common flags:
   --mode vanilla|supabase-compat   Output convention (default vanilla)
-  --role-model split|single        split: app_user/app_service roles
+  --role-model split|single        split: app_user/app_service roles (on capydb:
+                                   the platform's app_user, owner as service path)
                                    single: FORCE RLS, app connects as owner
   --keep-for-all                   Do not split FOR ALL policies per command
   --no-service-escape              single role model: no GUC-gated bypass policies
@@ -41,7 +42,8 @@ Common flags:
   --uid-type uuid|text             Type the user-id accessor returns (default uuid);
                                    text for non-uuid subjects such as Clerk's user_...
   --target postgres|capydb         Platform the bundle is for (default postgres);
-                                   capydb rejects the split role model up front
+                                   capydb creates no roles: split grants to the
+                                   platform's app_user, which must be enabled
   --out DIR                        Output directory (default capyrls_out)
   --stdout                         Print SQL to stdout instead of writing files
   --json                           Also emit capyrls_report.json
@@ -83,7 +85,7 @@ func (cf *commonFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&cf.appRole, "app-role", "app_user", "runtime role name (split role model)")
 	fs.StringVar(&cf.serviceRole, "service-role", "app_service", "service role name (split role model)")
 	fs.StringVar(&cf.uidType, "uid-type", "uuid", "type the user-id accessor returns: uuid, or text for non-uuid subjects (Clerk user_... ids)")
-	fs.StringVar(&cf.target, "target", "postgres", "platform the bundle is for: postgres, or capydb (no role creation)")
+	fs.StringVar(&cf.target, "target", "postgres", "platform the bundle is for: postgres, or capydb (no role creation; split uses the platform's app_user)")
 	fs.StringVar(&cf.out, "out", "capyrls_out", "output directory")
 	fs.BoolVar(&cf.stdout, "stdout", false, "print SQL to stdout instead of writing files")
 	fs.BoolVar(&cf.jsonOut, "json", false, "also emit capyrls_report.json")
