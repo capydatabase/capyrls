@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the capyrls release version.
-const Version = "1.1.0"
+const Version = "1.14.0"
 
 // Mode selects the output convention.
 type Mode int

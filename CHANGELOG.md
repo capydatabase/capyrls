@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-09-29
+
 ### Added
 
 - **`--uid-type text` for identity providers whose subjects are not uuids.** The user-id accessor
@@ -27,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   predicate cannot use the column's index, and a uuid column cannot hold a non-uuid subject, so the
   policy would silently match nothing. References through a table alias are not resolved, and
   `plpgsql` function bodies are only type-checked when called; the warning says so.
+
+### Fixed
+
+- **`capyrls version` and the report header print the real version.** `Version` had been `1.1.0`
+  since the first release.
 
 ## [1.13.1] - 2026-09-24
 
