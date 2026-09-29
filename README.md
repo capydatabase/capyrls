@@ -77,6 +77,34 @@ verbatim. Two limits to know before choosing it:
 
 A reasonable first step; adopt the vanilla convention later.
 
+## Non-uuid user ids (`--uid-type text`)
+
+Supabase's `auth.uid()` returns `uuid`, and by default so do the converted
+accessors (`auth.uid()` in compat mode, `app.user_id()` in vanilla mode). If
+your identity provider's subjects are not uuids - Clerk's `user_2abc...`, for
+one - every policy that calls the accessor raises
+`invalid input syntax for type uuid`. Pass `--uid-type text` and the accessor
+returns the subject as `text`, uncast.
+
+Every column the user id is compared to must then be `text` as well: Postgres
+has no implicit text-to-uuid conversion. That failure is loud, never silent -
+applying the bundle stops at the first policy comparing it to a uuid column
+(`42883 operator does not exist: text = uuid`) or at a uuid column defaulted to
+it (`42804`). The report names each such uuid column it can see (unaliased
+references in policies, and column defaults) with the fix; run it before you
+apply:
+
+```sql
+alter table public.todos alter column owner_id type text using owner_id::text;
+```
+
+capyrls does not cast the column side (`owner_id::text = ...`) for you: that
+predicate cannot use the column's index, and a uuid column cannot hold a
+non-uuid subject anyway, so every such policy would silently match nothing.
+One case is not caught at apply time: a `plpgsql` function body is only
+type-checked when called, so helpers listed under "Functions to review" need
+the same change by hand.
+
 ## Role models
 
 - `--role-model split` (default): creates `app_user` (runtime, cannot bypass

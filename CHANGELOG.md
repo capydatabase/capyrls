@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--uid-type text` for identity providers whose subjects are not uuids.** The user-id accessor
+  (`auth.uid()` in compat mode, `<prefix>.user_id()` in vanilla mode) returned `uuid` by casting
+  the claim or GUC, so a Clerk-style `user_2abc...` subject made every policy calling it raise
+  `22P02 invalid input syntax for type uuid`. With `--uid-type text` (`Options.UIDType = UIDText`)
+  it returns the subject as `text`, uncast. `uuid` stays the default, and its output is unchanged.
+  The report carries the choice (`uid_type` in JSON, "user id type" in Markdown) and the context
+  contract types `<prefix>.user_id` as `text`.
+- **The report names the uuid columns `--uid-type text` breaks.** Postgres has no implicit
+  text-to-uuid conversion, so a policy comparing the text user id to a uuid column fails
+  `CREATE POLICY` with `42883`, and a uuid column defaulted to it fails with `42804` - verified on
+  postgres:18, loud at apply time and never silent. capyrls reads column types from
+  `CREATE TABLE`/`ALTER TABLE` in the sources (and from `pg_attribute` with `--db`), flags each
+  policy that compares the user id to a uuid column directly (including the
+  `( SELECT auth.uid() AS uid)` form a live database renders), and emits one warning per column
+  with the `alter column ... type text` fix. It deliberately does not cast the column side: that
+  predicate cannot use the column's index, and a uuid column cannot hold a non-uuid subject, so the
+  policy would silently match nothing. References through a table alias are not resolved, and
+  `plpgsql` function bodies are only type-checked when called; the warning says so.
+
 ## [1.13.1] - 2026-09-24
 
 ### Fixed

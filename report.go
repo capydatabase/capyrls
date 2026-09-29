@@ -34,6 +34,7 @@ type Report struct {
 	Version   string          `json:"version"`
 	Mode      string          `json:"mode"`
 	RoleModel string          `json:"role_model"`
+	UIDType   string          `json:"uid_type"`
 	Policies  []PolicyOutcome `json:"policies"`
 	Claims    []ClaimMapping  `json:"claims"`
 	GUCs      []GUCSpec       `json:"gucs"`
@@ -63,7 +64,7 @@ func (r *Report) Markdown() string {
 	converted, skipped, blocked := r.counts()
 
 	fmt.Fprintf(&b, "# capyrls conversion report\n\n")
-	fmt.Fprintf(&b, "- mode: `%s`\n- role model: `%s`\n", r.Mode, r.RoleModel)
+	fmt.Fprintf(&b, "- mode: `%s`\n- role model: `%s`\n- user id type: `%s`\n", r.Mode, r.RoleModel, r.UIDType)
 	fmt.Fprintf(&b, "- policies: %d converted, %d skipped, %d need attention\n\n", converted, skipped, blocked)
 
 	if len(r.GUCs) > 0 {

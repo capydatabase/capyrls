@@ -35,7 +35,39 @@ func Load(ctx context.Context, db *sql.DB) (*capyrls.Catalog, error) {
 	if err := loadRoutines(ctx, db, cat); err != nil {
 		return nil, fmt.Errorf("introspect functions: %w", err)
 	}
+	if err := loadUUIDColumns(ctx, db, cat); err != nil {
+		return nil, fmt.Errorf("introspect uuid columns: %w", err)
+	}
 	return cat, nil
+}
+
+// loadUUIDColumns records every uuid column. The converter only asks whether a
+// column the user id is compared to is uuid (what --uid-type text breaks), so
+// the other types are not loaded.
+func loadUUIDColumns(ctx context.Context, db *sql.DB, cat *capyrls.Catalog) error {
+	rows, err := db.QueryContext(ctx, `
+		select n.nspname, c.relname, a.attname
+		from pg_catalog.pg_attribute a
+		join pg_catalog.pg_class c on c.oid = a.attrelid
+		join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+		where a.atttypid = 'pg_catalog.uuid'::pg_catalog.regtype
+		  and a.attnum > 0
+		  and not a.attisdropped
+		  and c.relkind in ('r', 'p')
+		  and n.nspname not in ('pg_catalog', 'information_schema')
+		order by n.nspname, c.relname, a.attname`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var schema, table, column string
+		if err := rows.Scan(&schema, &table, &column); err != nil {
+			return err
+		}
+		cat.SetColumnType(capyrls.QName{Schema: schema, Name: table}, column, "uuid")
+	}
+	return rows.Err()
 }
 
 func loadTables(ctx context.Context, db *sql.DB, cat *capyrls.Catalog) error {

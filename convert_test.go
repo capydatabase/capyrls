@@ -629,3 +629,168 @@ func TestConvertCompatSingleReportsNoServicePathWithoutTheFlag(t *testing.T) {
 		}
 	}
 }
+
+func warningContaining(rep Report, substr string) string {
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, substr) {
+			return w
+		}
+	}
+	return ""
+}
+
+// The default keeps Supabase's uuid-typed auth.uid(); --uid-type text drops
+// the cast so a Clerk-style `user_...` subject cannot raise 22P02.
+func TestConvertUIDTypeDefaultIsUUID(t *testing.T) {
+	res, err := Convert(fixture, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prelude := findFile(t, res, "capyrls_01_prelude.sql")
+	if !strings.Contains(prelude, "returns uuid") || !strings.Contains(prelude, "'app.user_id', true), '')::uuid") {
+		t.Errorf("default prelude should keep the uuid accessor:\n%s", prelude)
+	}
+	if res.Report.UIDType != "uuid" || res.Report.GUCs[0].Type != "uuid (text GUC)" {
+		t.Errorf("report uid type %q, user_id GUC type %q", res.Report.UIDType, res.Report.GUCs[0].Type)
+	}
+	if w := warningContaining(res.Report, "--uid-type text"); w != "" {
+		t.Errorf("default mode must not warn about --uid-type text: %s", w)
+	}
+}
+
+func TestConvertUIDTypeTextVanilla(t *testing.T) {
+	res, err := Convert(fixture, Options{UIDType: UIDText})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prelude := findFile(t, res, "capyrls_01_prelude.sql")
+	if !strings.Contains(prelude, "create or replace function app.user_id()\nreturns text\n") {
+		t.Errorf("app.user_id() should return text:\n%s", prelude)
+	}
+	if strings.Contains(prelude, "::uuid") || strings.Contains(prelude, "<uuid>") {
+		t.Errorf("text prelude must not cast to or document uuid:\n%s", prelude)
+	}
+	if res.Report.UIDType != "text" || res.Report.GUCs[0].Type != "text" {
+		t.Errorf("report uid type %q, user_id GUC type %q", res.Report.UIDType, res.Report.GUCs[0].Type)
+	}
+	if md := res.Report.Markdown(); !strings.Contains(md, "- user id type: `text`") {
+		t.Errorf("markdown report should state the user id type:\n%s", md)
+	}
+
+	// Both uuid columns the fixture compares to auth.uid() - and defaults to
+	// it - are named, with the fix.
+	for column, policy := range map[string]string{
+		"public.todos.owner_id": "todos_all",
+		"public.profiles.id":    "profiles_owner_select",
+	} {
+		w := warningContaining(res.Report, "uuid column "+column+" ")
+		if w == "" {
+			t.Errorf("no warning for uuid column %s: %v", column, res.Report.Warnings)
+			continue
+		}
+		for _, want := range []string{
+			"is compared to the user id by policy " + policy,
+			"takes the user id as its default",
+			"type text using",
+		} {
+			if !strings.Contains(w, want) {
+				t.Errorf("warning for %s missing %q: %s", column, want, w)
+			}
+		}
+		if detail := outcomeFor(t, res.Report, policy).Detail; !strings.Contains(detail, "uuid column "+column) {
+			t.Errorf("policy %s detail should name %s: %q", policy, column, detail)
+		}
+	}
+	if w := warningContaining(res.Report, "--uid-type text: the user id (`app.user_id()`) is text"); w == "" {
+		t.Errorf("missing the general text-mode warning: %v", res.Report.Warnings)
+	}
+	// Status stays converted: the SQL is right for a text column, and
+	// Postgres rejects it loudly at apply time if the column is still uuid.
+	if got := outcomeFor(t, res.Report, "todos_all").Status; got != "converted" {
+		t.Errorf("todos_all status %q, want converted", got)
+	}
+	// org_read compares a claim, not the user id.
+	if detail := outcomeFor(t, res.Report, "org_read").Detail; strings.Contains(detail, "uuid column") {
+		t.Errorf("org_read does not compare the user id: %q", detail)
+	}
+}
+
+func TestConvertUIDTypeTextCompat(t *testing.T) {
+	res, err := Convert(fixture, Options{Mode: ModeCompat, UIDType: UIDText})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prelude := findFile(t, res, "capyrls_01_prelude.sql")
+	if !strings.Contains(prelude, "create or replace function auth.uid()\nreturns text\nlanguage sql stable parallel safe\nas $$\n  select nullif(auth.jwt() ->> 'sub', '')\n$$;") {
+		t.Errorf("auth.uid() shim should return the sub claim as text, uncast:\n%s", prelude)
+	}
+	if strings.Contains(prelude, "::uuid") {
+		t.Errorf("text shim must not cast to uuid:\n%s", prelude)
+	}
+	if w := warningContaining(res.Report, "--uid-type text: the user id (`auth.uid()`) is text"); w == "" {
+		t.Errorf("compat warning should name auth.uid(): %v", res.Report.Warnings)
+	}
+	if !strings.Contains(res.Report.GUCs[0].Description, "as text") {
+		t.Errorf("claims contract should say sub is read as text: %q", res.Report.GUCs[0].Description)
+	}
+}
+
+// Detection works on the forms a live database renders (pg_get_expr wraps the
+// call as a scalar subquery) and skips comparisons that are not text = uuid.
+func TestConvertUIDTypeTextDetection(t *testing.T) {
+	cat := NewCatalog()
+	todos := QName{Schema: "public", Name: "todos"}
+	members := QName{Schema: "public", Name: "members"}
+	cat.SetTableRLS(todos, true, false)
+	cat.SetColumnType(todos, "owner_id", "uuid")
+	cat.SetColumnType(todos, "editor_id", "uuid")
+	cat.SetColumnType(todos, "reviewer_id", "uuid")
+	cat.SetColumnType(members, "user_id", "uuid")
+	for _, p := range []struct{ name, using string }{
+		{"live_form", "(owner_id = ( SELECT auth.uid() AS uid))"},
+		{"qualified_self", "(select auth.uid()) = todos.editor_id"},
+		{"other_table", "exists (select 1 from public.members m where public.members.user_id = auth.uid())"},
+		{"cast_away", "reviewer_id::text = auth.uid()"},
+		{"text_column", "auth.uid() = author_name"},
+		{"aliased_miss", "exists (select 1 from public.members m where m.user_id = auth.uid())"},
+	} {
+		cat.AddPolicy(&Policy{Name: p.name, Table: todos, Permissive: true, Cmd: CmdSelect, Using: p.using, Origin: "test"})
+	}
+	res, err := ConvertCatalog(cat, Options{UIDType: UIDText})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for policy, column := range map[string]string{
+		"live_form":      "public.todos.owner_id",
+		"qualified_self": "public.todos.editor_id",
+		"other_table":    "public.members.user_id",
+	} {
+		if detail := outcomeFor(t, res.Report, policy).Detail; !strings.Contains(detail, "uuid column "+column) {
+			t.Errorf("%s: detail should name %s, got %q", policy, column, detail)
+		}
+	}
+	for _, policy := range []string{"cast_away", "text_column", "aliased_miss"} {
+		if detail := outcomeFor(t, res.Report, policy).Detail; strings.Contains(detail, "uuid column") {
+			t.Errorf("%s: should not be flagged, got %q", policy, detail)
+		}
+	}
+	if w := warningContaining(res.Report, "uuid column public.todos.reviewer_id"); w != "" {
+		t.Errorf("a column cast to text is not a conflict: %s", w)
+	}
+}
+
+func TestRewriteUIDTypeText(t *testing.T) {
+	res, err := Rewrite(fixture, Options{UIDType: UIDText})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Report.UIDType != "text" {
+		t.Errorf("rewrite report uid type %q", res.Report.UIDType)
+	}
+	if !strings.Contains(findFile(t, res, "capyrls_01_prelude.sql"), "returns text") {
+		t.Error("rewrite prelude should emit the text accessor")
+	}
+	if detail := outcomeFor(t, res.Report, "todos_all").Detail; !strings.Contains(detail, "uuid column public.todos.owner_id") {
+		t.Errorf("rewrite should flag todos_all too: %q", detail)
+	}
+}

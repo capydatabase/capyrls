@@ -194,8 +194,9 @@ func userPresenceCond(opts Options, rw *rewriter, present, selfRef bool) string 
 	// Compat mode tests auth.role(), not auth.uid(): role is what PostgREST
 	// actually switched on, and the shim defaults it to 'anon' when no claims
 	// are set, so an absent token reads as anon exactly as it did on Supabase.
-	// It also avoids auth.uid()'s ::uuid cast, which raises for providers whose
-	// subject is not a uuid (Clerk's `user_...` ids).
+	// It also avoids auth.uid()'s ::uuid cast under the default --uid-type uuid,
+	// which raises for providers whose subject is not a uuid (Clerk's
+	// `user_...` ids); --uid-type text removes that cast altogether.
 	// NOT wrapped in `(select ...)`. The initplan form is the usual RLS
 	// performance trick, but it sets the policy's hasSubLinks flag, and
 	// Postgres's static recursion check then rejects any policy that reaches
@@ -357,16 +358,28 @@ func writeSQLFunction(b *strings.Builder, comment, name, returns, body string) {
 	fmt.Fprintf(b, "create or replace function %s()\nreturns %s\nlanguage sql stable parallel safe\nas $$\n  %s\n$$;\n\n", name, returns, body)
 }
 
+// userIDSQL returns the user-id accessor's return type, the cast its body
+// applies to the raw text value, and the placeholder the prelude comments show.
+// Under UIDText the value is returned as set: no cast, so a subject that is not
+// a uuid cannot raise.
+func userIDSQL(u UIDType) (returns, cast, placeholder string) {
+	if u == UIDText {
+		return "text", "", "<user id>"
+	}
+	return "uuid", "::uuid", "<uuid>"
+}
+
 // emitPrelude renders the context schema + accessor functions.
 func emitPrelude(opts Options, rw *rewriter) string {
 	var b strings.Builder
+	uidReturns, uidCast, uidPlaceholder := userIDSQL(opts.UIDType)
 	if opts.Mode == ModeCompat {
 		b.WriteString(fileHeader("Supabase-compatible auth shim: auth.uid()/jwt()/role()/email() backed by the request.jwt.claims GUC."))
-		b.WriteString(`-- Your application verifies the caller's JWT, then sets the claims for the
+		fmt.Fprintf(&b, `-- Your application verifies the caller's JWT, then sets the claims for the
 -- transaction (true = transaction-local, safe behind transaction pooling):
 --
 --   begin;
---   select set_config('request.jwt.claims', '{"sub":"<uuid>","role":"authenticated"}', true);
+--   select set_config('request.jwt.claims', '{"sub":"%s","role":"authenticated"}', true);
 --   -- queries run under RLS here
 --   commit;
 --
@@ -377,11 +390,11 @@ func emitPrelude(opts Options, rw *rewriter) string {
 
 create schema if not exists auth;
 
-`)
+`, uidPlaceholder)
 		writeSQLFunction(&b, "", "auth.jwt", "jsonb",
 			"select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb")
-		writeSQLFunction(&b, "", "auth.uid", "uuid",
-			"select nullif(auth.jwt() ->> 'sub', '')::uuid")
+		writeSQLFunction(&b, "", "auth.uid", uidReturns,
+			"select nullif(auth.jwt() ->> 'sub', '')"+uidCast)
 		writeSQLFunction(&b, "", "auth.role", "text",
 			"select coalesce(nullif(auth.jwt() ->> 'role', ''), 'anon')")
 		writeSQLFunction(&b, "", "auth.email", "text",
@@ -397,7 +410,7 @@ create schema if not exists auth;
 -- pooling, resets at commit/rollback):
 --
 --   begin;
---   select set_config('%s.user_id', '<uuid>', true);
+--   select set_config('%s.user_id', '%s', true);
 --   -- queries run under RLS here
 --   commit;
 --
@@ -405,11 +418,11 @@ create schema if not exists auth;
 
 create schema if not exists %s;
 
-`, p, QuoteIdent(p))
+`, p, uidPlaceholder, QuoteIdent(p))
 
 	writeSQLFunction(&b, "The authenticated user (was auth.uid() / the JWT 'sub' claim).",
-		p+".user_id", "uuid",
-		fmt.Sprintf("select nullif(current_setting('%s.user_id', true), '')::uuid", p))
+		p+".user_id", uidReturns,
+		fmt.Sprintf("select nullif(current_setting('%s.user_id', true), '')%s", p, uidCast))
 
 	if rw.usedRole || emitsServiceEscape(opts) {
 		writeSQLFunction(&b, "The caller's access class (was auth.role()).",

@@ -91,10 +91,30 @@ type Catalog struct {
 	Defaults []ColumnDefault
 	Routines []Routine
 	Notes    []string
+	// ColumnTypes maps "schema.table.column" to the column's leading type
+	// name, lower-cased ("uuid", "text", "uuid[]"). It is only ever compared
+	// against "uuid" - to find the columns --uid-type text breaks - so it may
+	// be partial: the live subpackage records uuid columns only.
+	ColumnTypes map[string]string
 }
 
 func NewCatalog() *Catalog {
-	return &Catalog{Tables: map[string]*Table{}}
+	return &Catalog{Tables: map[string]*Table{}, ColumnTypes: map[string]string{}}
+}
+
+// SetColumnType records a column's type; "" forgets the column (DROP COLUMN).
+// Used by external catalog builders such as the live subpackage.
+func (c *Catalog) SetColumnType(table QName, column, typ string) {
+	key := table.Key() + "." + column
+	if typ == "" {
+		delete(c.ColumnTypes, key)
+		return
+	}
+	c.ColumnTypes[key] = typ
+}
+
+func (c *Catalog) columnType(table QName, column string) string {
+	return c.ColumnTypes[table.Key()+"."+column]
 }
 
 // SetTableRLS records a table's row-security flags. Used by external catalog

@@ -362,6 +362,10 @@ func parseAlterTable(cat *Catalog, c *cursor, stmt statement) {
 				c.next()
 				continue
 			}
+			if c.matchWord("type") || c.matchWord("set", "data", "type") {
+				cat.SetColumnType(table, column, columnTypeOf(captureUntilTopLevelComma(c)))
+				continue
+			}
 			if c.matchWord("set", "default") {
 				expr := captureDefaultExpr(c, stmt)
 				if exprReferencesAuth(expr) {
@@ -377,15 +381,56 @@ func parseAlterTable(cat *Catalog, c *cursor, stmt statement) {
 				continue
 			}
 			element := captureUntilTopLevelComma(c)
+			cat.SetColumnType(table, column, columnTypeOf(element))
 			if expr := defaultExprIn(element, stmt); expr != "" && exprReferencesAuth(expr) {
 				cat.Defaults = append(cat.Defaults, ColumnDefault{
 					Table: table, Column: column, Expr: expr, Origin: stmt.origin,
 				})
 			}
+		case c.matchWord("drop", "column"):
+			c.matchWord("if", "exists")
+			if column, ok := c.identLike(); ok {
+				cat.SetColumnType(table, column, "")
+			}
+		case c.matchWord("rename", "column"):
+			from, ok := c.identLike()
+			if !ok || !c.matchWord("to") {
+				continue
+			}
+			if to, ok := c.identLike(); ok {
+				typ := cat.columnType(table, from)
+				cat.SetColumnType(table, from, "")
+				cat.SetColumnType(table, to, typ)
+			}
 		default:
 			c.next()
 		}
 	}
+}
+
+// columnTypeOf returns the leading type name of a column definition's token
+// run (the tokens after the column name): lower-cased, schema qualifier
+// dropped, "[]" appended for an array. Multi-word types keep only their first
+// word - the result is only compared against "uuid".
+func columnTypeOf(element []token) string {
+	i := nextSig(element, 0)
+	if i == len(element) || element[i].Kind != tIdent && element[i].Kind != tQIdent {
+		return ""
+	}
+	typ := element[i].Val
+	j := nextSig(element, i+1)
+	if j < len(element) && element[j].Kind == tOp && element[j].Text == "." {
+		k := nextSig(element, j+1)
+		if k == len(element) || element[k].Kind != tIdent && element[k].Kind != tQIdent {
+			return ""
+		}
+		typ = element[k].Val
+		j = nextSig(element, k+1)
+	}
+	if j < len(element) && element[j].Kind == tOp && element[j].Text == "[" {
+		typ += "[]"
+	}
+	return typ
 }
 
 // captureUntilTopLevelComma consumes and returns the significant tokens up to
@@ -518,6 +563,7 @@ func scanColumnDefault(cat *Catalog, table QName, element []token, stmt statemen
 		return
 	}
 	column := lead.Val
+	cat.SetColumnType(table, column, columnTypeOf(element[first+1:]))
 	expr := defaultExprIn(element[first+1:], stmt)
 	if expr != "" && exprReferencesAuth(expr) {
 		cat.Defaults = append(cat.Defaults, ColumnDefault{

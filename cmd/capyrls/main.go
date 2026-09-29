@@ -38,6 +38,8 @@ Common flags:
   --keep-for-all                   Do not split FOR ALL policies per command
   --no-service-escape              single role model: no GUC-gated bypass policies
   --prefix NAME                    Schema/GUC namespace (default app)
+  --uid-type uuid|text             Type the user-id accessor returns (default uuid);
+                                   text for non-uuid subjects such as Clerk's user_...
   --out DIR                        Output directory (default capyrls_out)
   --stdout                         Print SQL to stdout instead of writing files
   --json                           Also emit capyrls_report.json
@@ -62,6 +64,7 @@ type commonFlags struct {
 	prefix          string
 	appRole         string
 	serviceRole     string
+	uidType         string
 	out             string
 	stdout          bool
 	jsonOut         bool
@@ -76,6 +79,7 @@ func (cf *commonFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&cf.prefix, "prefix", "app", "schema and GUC namespace")
 	fs.StringVar(&cf.appRole, "app-role", "app_user", "runtime role name (split role model)")
 	fs.StringVar(&cf.serviceRole, "service-role", "app_service", "service role name (split role model)")
+	fs.StringVar(&cf.uidType, "uid-type", "uuid", "type the user-id accessor returns: uuid, or text for non-uuid subjects (Clerk user_... ids)")
 	fs.StringVar(&cf.out, "out", "capyrls_out", "output directory")
 	fs.BoolVar(&cf.stdout, "stdout", false, "print SQL to stdout instead of writing files")
 	fs.BoolVar(&cf.jsonOut, "json", false, "also emit capyrls_report.json")
@@ -105,6 +109,14 @@ func (cf *commonFlags) options() (capyrls.Options, error) {
 		opts.RoleModel = capyrls.RoleSingle
 	default:
 		return opts, fmt.Errorf("unknown --role-model %q (split or single)", cf.roleModel)
+	}
+	switch cf.uidType {
+	case "uuid":
+		opts.UIDType = capyrls.UIDUUID
+	case "text":
+		opts.UIDType = capyrls.UIDText
+	default:
+		return opts, fmt.Errorf("unknown --uid-type %q (uuid or text)", cf.uidType)
 	}
 	return opts, nil
 }

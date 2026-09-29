@@ -137,3 +137,38 @@ func TestParseQuotedIdentifiers(t *testing.T) {
 		t.Fatalf("rendering wrong: %s", p.Table)
 	}
 }
+
+func TestParseColumnTypes(t *testing.T) {
+	cat := mustCatalog(t, `
+create table public.todos (
+  id bigint generated always as identity primary key,
+  owner_id uuid not null,
+  tags uuid[],
+  gone uuid,
+  "Author" pg_catalog.uuid,
+  title character varying(200),
+  constraint todos_owner unique (owner_id)
+);
+alter table public.todos add column if not exists editor uuid;
+alter table public.todos alter column title type uuid using title::uuid;
+alter table public.todos alter column editor set data type text;
+alter table public.todos drop column if exists gone;
+alter table public.todos rename column owner_id to creator_id;
+`)
+	todos := QName{Schema: "public", Name: "todos"}
+	for column, want := range map[string]string{
+		"id":          "bigint",
+		"creator_id":  "uuid",
+		"owner_id":    "",
+		"tags":        "uuid[]",
+		"gone":        "",
+		"Author":      "uuid",
+		"title":       "uuid",
+		"editor":      "text",
+		"todos_owner": "",
+	} {
+		if got := cat.columnType(todos, column); got != want {
+			t.Errorf("column %s: type %q, want %q", column, got, want)
+		}
+	}
+}

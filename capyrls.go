@@ -66,6 +66,28 @@ func (r RoleModel) String() string {
 	return "split"
 }
 
+// UIDType is the SQL type the converted user-id accessor returns: auth.uid()
+// in compat mode, <prefix>.user_id() in vanilla mode.
+type UIDType int
+
+const (
+	// UIDUUID returns uuid, as Supabase's auth.uid() does. A subject that is
+	// not a uuid makes the accessor raise (22P02) in every policy that calls it.
+	UIDUUID UIDType = iota
+	// UIDText returns the subject as text with no cast, for identity providers
+	// whose subjects are not uuids (Clerk's user_... ids). Every column the
+	// user id is compared to must then be text too: Postgres has no text =
+	// uuid operator, so a uuid column fails CREATE POLICY with 42883.
+	UIDText
+)
+
+func (u UIDType) String() string {
+	if u == UIDText {
+		return "text"
+	}
+	return "uuid"
+}
+
 // Options control a conversion. The zero value is the recommended setup:
 // vanilla mode, role-split model, FOR ALL policies split per command, service
 // escape enabled for the single-role model.
@@ -83,6 +105,8 @@ type Options struct {
 	// AppRole and ServiceRole name the roles for the role-split model.
 	AppRole     string
 	ServiceRole string
+	// UIDType is the user-id accessor's return type, default uuid.
+	UIDType UIDType
 }
 
 func (o Options) withDefaults() Options {
@@ -138,7 +162,8 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 	rep := Report{
 		Tool: "capyrls", Version: Version,
 		Mode: opts.Mode.String(), RoleModel: opts.RoleModel.String(),
-		Notes: append([]string{}, cat.Notes...),
+		UIDType: opts.UIDType.String(),
+		Notes:   append([]string{}, cat.Notes...),
 	}
 
 	policies := append([]*Policy{}, cat.Policies...)
@@ -189,6 +214,10 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 	}
 	routineRefs := map[string]int{}
 	linkedPolicies := 0
+	var uidCheck *uidTextCheck
+	if opts.UIDType == UIDText {
+		uidCheck = newUIDTextCheck(cat)
+	}
 
 	for _, t := range cat.sortedTables() {
 		if t.RLSEnabled && !supabaseManagedSchemas[t.Name.EffectiveSchema()] {
@@ -287,6 +316,14 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 				detail += "; " + note
 			} else {
 				detail = note
+			}
+		}
+		if uidCheck != nil {
+			if columns := uidCheck.policy(p); len(columns) > 0 {
+				if detail != "" {
+					detail += "; "
+				}
+				detail += policyNote(columns)
 			}
 		}
 		for _, rp := range rendered {
@@ -406,6 +443,9 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 	rep.Claims = rw.sortedClaims()
 	rep.GUCs = buildGUCContract(opts, rw)
 	rep.Warnings = append(rep.Warnings, rw.warnings...)
+	if uidCheck != nil {
+		rep.Warnings = append(rep.Warnings, uidCheck.warnings(opts)...)
+	}
 	rep.Warnings = dedupe(rep.Warnings)
 	if rep.Defaults == nil {
 		rep.Defaults = []string{}
@@ -447,7 +487,8 @@ func Rewrite(sources []Source, opts Options) (*Result, error) {
 	rep := Report{
 		Tool: "capyrls", Version: Version,
 		Mode: opts.Mode.String(), RoleModel: opts.RoleModel.String(),
-		Notes: append([]string{}, cat.Notes...),
+		UIDType: opts.UIDType.String(),
+		Notes:   append([]string{}, cat.Notes...),
 	}
 
 	var files []OutFile
@@ -462,6 +503,10 @@ func Rewrite(sources []Source, opts Options) (*Result, error) {
 	// Policies keep their TO clauses in rewrite mode; surface which roles
 	// must exist and ship stubs for them.
 	compatRoles := map[string]bool{}
+	var uidCheck *uidTextCheck
+	if opts.UIDType == UIDText {
+		uidCheck = newUIDTextCheck(cat)
+	}
 	for _, p := range cat.Policies {
 		for _, role := range p.Roles {
 			switch role {
@@ -469,9 +514,14 @@ func Rewrite(sources []Source, opts Options) (*Result, error) {
 				compatRoles[role] = true
 			}
 		}
+		detail := "expressions rewritten in place; TO clause kept as written"
+		if uidCheck != nil {
+			if columns := uidCheck.policy(p); len(columns) > 0 {
+				detail += "; " + policyNote(columns)
+			}
+		}
 		rep.Policies = append(rep.Policies, PolicyOutcome{
-			Policy: p.Name, Table: p.Table.Key(), Status: "converted",
-			Detail: "expressions rewritten in place; TO clause kept as written",
+			Policy: p.Name, Table: p.Table.Key(), Status: "converted", Detail: detail,
 		})
 	}
 	sortOutcomes(rep.Policies)
@@ -496,7 +546,11 @@ func Rewrite(sources []Source, opts Options) (*Result, error) {
 	}
 	rep.Claims = rw.sortedClaims()
 	rep.GUCs = buildGUCContract(opts, rw)
-	rep.Warnings = dedupe(append(rep.Warnings, rw.warnings...))
+	rep.Warnings = append(rep.Warnings, rw.warnings...)
+	if uidCheck != nil {
+		rep.Warnings = append(rep.Warnings, uidCheck.warnings(opts)...)
+	}
+	rep.Warnings = dedupe(rep.Warnings)
 	if rep.Policies == nil {
 		rep.Policies = []PolicyOutcome{}
 	}
@@ -520,12 +574,16 @@ func buildGUCContract(opts Options, rw *rewriter) []GUCSpec {
 	if opts.Mode == ModeCompat {
 		return []GUCSpec{{
 			Name: "request.jwt.claims", Type: "json (text GUC)",
-			Description: "the verified JWT claims; must include `sub` (and `role`/`email` where policies use them)",
+			Description: fmt.Sprintf("the verified JWT claims; must include `sub`, read by `auth.uid()` as %s (and `role`/`email` where policies use them)", opts.UIDType),
 		}}
 	}
 	p := opts.Prefix
+	userIDType := "uuid (text GUC)"
+	if opts.UIDType == UIDText {
+		userIDType = "text"
+	}
 	gucs := []GUCSpec{{
-		Name: p + ".user_id", Type: "uuid (text GUC)",
+		Name: p + ".user_id", Type: userIDType,
 		Description: "the authenticated user's id (was `auth.uid()`)",
 	}}
 	if rw.usedRole || emitsServiceEscape(opts) {
