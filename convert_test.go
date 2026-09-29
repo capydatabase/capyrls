@@ -1,6 +1,7 @@
 package capyrls
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -611,22 +612,122 @@ func TestForceCarriesTheForeignKeyWarning(t *testing.T) {
 	}
 }
 
-// Compat mode never emits the service escape, so under the single role model a
-// service_role-only policy has lost its access even without --no-service-escape,
-// and the report must not claim the escape still covers it.
-func TestConvertCompatSingleReportsNoServicePathWithoutTheFlag(t *testing.T) {
+// Compat + single emits the service escape too, keyed on the claims' role:
+// `service_role` is what a Supabase service key's JWT carried, so the call
+// sites that used it keep a path. The escape must not depend on the vanilla
+// accessor schema, and a service_role-only policy is covered, not lost.
+func TestConvertCompatSingleEmitsClaimsServiceEscape(t *testing.T) {
 	res, err := Convert(fixture, Options{Mode: ModeCompat, RoleModel: RoleSingle})
 	if err != nil {
 		t.Fatal(err)
 	}
-	skipped := outcomeFor(t, res.Report, "admin_all")
-	if skipped.Status != "skipped" || !strings.Contains(skipped.Detail, "no service path exists") {
-		t.Errorf("service-only policy outcome = %+v; want a skip naming the absent service path", skipped)
+	force := findFile(t, res, "capyrls_02_force_rls.sql")
+	for _, want := range []string{
+		"create policy capyrls_service_escape on public.todos",
+		"using (auth.role() = 'service_role')",
+		"with check (auth.role() = 'service_role')",
+	} {
+		if !strings.Contains(force, want) {
+			t.Errorf("compat force file missing %q", want)
+		}
+	}
+	if strings.Contains(force, "(select auth.role())") {
+		t.Error("escape must not be wrapped in (select ...): the sublink breaks sibling self-referencing policies")
 	}
 	for _, f := range res.Files {
 		if strings.Contains(f.SQL, ".is_service") {
-			t.Errorf("%s defines is_service, but compat mode has no service escape to gate", f.Name)
+			t.Errorf("%s references is_service, which compat mode does not define", f.Name)
 		}
+		if strings.Contains(strings.ToLower(f.SQL), "create role") {
+			t.Errorf("%s emits CREATE ROLE; the compat escape must need no roles", f.Name)
+		}
+	}
+	skipped := outcomeFor(t, res.Report, "admin_all")
+	if skipped.Status != "skipped" || !strings.Contains(skipped.Detail, "already bypasses RLS") {
+		t.Errorf("service-only policy outcome = %+v; want a skip covered by the escape", skipped)
+	}
+	if !strings.Contains(res.Report.GUCs[0].Description, "service_role") {
+		t.Errorf("compat GUC contract does not document the escape: %q", res.Report.GUCs[0].Description)
+	}
+	prelude := findFile(t, res, "capyrls_01_prelude.sql")
+	if !strings.Contains(prelude, `"role":"service_role"`) {
+		t.Error("compat prelude does not explain the service context")
+	}
+
+	// --no-service-escape still removes it, and the report says the access is gone.
+	res2, err := Convert(fixture, Options{Mode: ModeCompat, RoleModel: RoleSingle, NoServiceEscape: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(findFile(t, res2, "capyrls_02_force_rls.sql"), "capyrls_service_escape") {
+		t.Error("NoServiceEscape must suppress the compat escape")
+	}
+	skipped2 := outcomeFor(t, res2.Report, "admin_all")
+	if !strings.Contains(skipped2.Detail, "no service path exists") {
+		t.Errorf("service-only policy outcome = %+v; want a skip naming the absent service path", skipped2)
+	}
+}
+
+// A permissive escape cannot lift a restrictive policy - restrictive policies
+// are ANDed with everything - so each one carries the escape itself, in both
+// modes, and only when the escape exists.
+func TestServiceEscapeLiftsRestrictivePolicies(t *testing.T) {
+	src := []Source{{Name: "r.sql", SQL: `
+create table public.docs (id bigint, owner_id uuid, locked boolean);
+alter table public.docs enable row level security;
+create policy docs_own on public.docs for all to authenticated
+  using (auth.uid() = owner_id) with check (auth.uid() = owner_id);
+create policy docs_unlocked on public.docs as restrictive for update to authenticated
+  using (not locked) with check (not locked);
+`}}
+	for _, tc := range []struct {
+		opts Options
+		want string
+	}{
+		{Options{RoleModel: RoleSingle}, "app.is_service() or ("},
+		{Options{Mode: ModeCompat, RoleModel: RoleSingle}, "auth.role() = 'service_role' or ("},
+	} {
+		res, err := Convert(src, tc.opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		policies := findFile(t, res, "capyrls_03_policies.sql")
+		if n := strings.Count(policies, tc.want); n != 2 {
+			// Exactly two: USING and WITH CHECK of the restrictive policy. More
+			// would mean it leaked into the permissive ones, which the escape
+			// policy already covers.
+			t.Errorf("mode=%v: want the escape ORed into USING and WITH CHECK of the restrictive policy only (2), got %d:\n%s", tc.opts.Mode, n, policies)
+		}
+		if got := outcomeFor(t, res.Report, "docs_unlocked"); !strings.Contains(got.Detail, "restrictive") {
+			t.Errorf("mode=%v: restrictive outcome detail = %q", tc.opts.Mode, got.Detail)
+		}
+	}
+	res, err := Convert(src, Options{RoleModel: RoleSingle, NoServiceEscape: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(findFile(t, res, "capyrls_03_policies.sql"), "is_service") {
+		t.Error("restrictive policies must not reference the escape when it is not emitted")
+	}
+}
+
+// The split role model creates roles; CapyDB's database role cannot, so the
+// conversion refuses up front instead of producing a bundle that stops at its
+// first CREATE ROLE.
+func TestTargetCapyDBRejectsSplitRoles(t *testing.T) {
+	for _, mode := range []Mode{ModeVanilla, ModeCompat} {
+		if _, err := Convert(fixture, Options{Mode: mode, RoleModel: RoleSplit, Target: TargetCapyDB}); !errors.Is(err, ErrSplitRolesUnsupported) {
+			t.Errorf("mode=%v convert: err = %v, want ErrSplitRolesUnsupported", mode, err)
+		}
+		if _, err := Rewrite(fixture, Options{Mode: mode, RoleModel: RoleSplit, Target: TargetCapyDB}); !errors.Is(err, ErrSplitRolesUnsupported) {
+			t.Errorf("mode=%v rewrite: err = %v, want ErrSplitRolesUnsupported", mode, err)
+		}
+		if _, err := Convert(fixture, Options{Mode: mode, RoleModel: RoleSingle, Target: TargetCapyDB}); err != nil {
+			t.Errorf("mode=%v single on capydb: %v", mode, err)
+		}
+	}
+	if _, err := Convert(fixture, Options{RoleModel: RoleSplit}); err != nil {
+		t.Errorf("split on generic postgres must still work: %v", err)
 	}
 }
 
@@ -792,5 +893,18 @@ func TestRewriteUIDTypeText(t *testing.T) {
 	}
 	if detail := outcomeFor(t, res.Report, "todos_all").Detail; !strings.Contains(detail, "uuid column public.todos.owner_id") {
 		t.Errorf("rewrite should flag todos_all too: %q", detail)
+	}
+}
+
+// Rewrite keeps TO clauses; under the single role model there is no roles file,
+// so the report must not claim one creates them.
+func TestRewriteSingleRoleSaysRolesMustExist(t *testing.T) {
+	res, err := Rewrite(fixture, Options{Mode: ModeCompat, RoleModel: RoleSingle, Target: TargetCapyDB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := warningContaining(res.Report, "TO clauses")
+	if strings.Contains(w, "capyrls_02_roles.sql") || !strings.Contains(w, "must exist") || !strings.Contains(w, "CapyDB") {
+		t.Errorf("rewrite single-role warning = %q", w)
 	}
 }

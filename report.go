@@ -40,8 +40,13 @@ type Report struct {
 	GUCs      []GUCSpec       `json:"gucs"`
 	Defaults  []string        `json:"column_defaults"`
 	Routines  []string        `json:"routines_to_review"`
-	Warnings  []string        `json:"warnings"`
-	Notes     []string        `json:"notes"`
+	// DefinerWrites are SECURITY DEFINER functions whose bodies write tables
+	// that are FORCEd once the bundle is applied; DefinerFix is the remedy
+	// for this configuration (Markdown).
+	DefinerWrites []DefinerWrite `json:"security_definer_writes"`
+	DefinerFix    string         `json:"security_definer_fix,omitempty"`
+	Warnings      []string       `json:"warnings"`
+	Notes         []string       `json:"notes"`
 }
 
 func (r *Report) counts() (converted, skipped, blocked int) {
@@ -133,6 +138,16 @@ func (r *Report) Markdown() string {
 		b.WriteString("These functions reference `auth.*` in their bodies. Function bodies are not\nrewritten automatically - apply the same substitutions by hand:\n\n")
 		for _, f := range r.Routines {
 			fmt.Fprintf(&b, "- %s\n", f)
+		}
+		b.WriteString("\n")
+	}
+
+	if len(r.DefinerWrites) > 0 {
+		b.WriteString("## SECURITY DEFINER functions under FORCE\n\n")
+		b.WriteString(r.DefinerFix)
+		b.WriteString("\n\n")
+		for _, d := range r.DefinerWrites {
+			fmt.Fprintf(&b, "- `%s` (%s) writes %s\n", d.Function, d.Origin, "`"+strings.Join(d.Tables, "`, `")+"`")
 		}
 		b.WriteString("\n")
 	}

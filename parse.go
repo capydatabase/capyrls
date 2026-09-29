@@ -208,8 +208,14 @@ func applyStatement(cat *Catalog, stmt statement) {
 			noteAuthRefs(cat, stmt)
 		}
 	case c.matchWord("drop"):
-		if c.matchWord("policy") {
+		switch {
+		case c.matchWord("policy"):
 			parseDropPolicy(cat, c, stmt)
+		case c.matchWord("function"), c.matchWord("procedure"):
+			c.matchWord("if", "exists")
+			if name, ok := c.qname(); ok {
+				cat.dropSecurityDefiner(name)
+			}
 		}
 	default:
 		noteAuthRefs(cat, stmt)
@@ -626,6 +632,12 @@ func parseCreateRoutine(cat *Catalog, c *cursor, stmt statement) {
 	name, ok := c.qname()
 	if !ok {
 		return
+	}
+	if isSecurityDefiner(stmt.toks) {
+		cat.AddSecurityDefiner(name, routineBody(stmt.toks), stmt.origin)
+	} else {
+		// CREATE OR REPLACE ... SECURITY INVOKER supersedes an earlier definer.
+		cat.dropSecurityDefiner(name)
 	}
 	// A routine body is a string token (dollar-quoted or plain); references
 	// can also appear in DEFAULT parameter values or the SQL-standard body.
