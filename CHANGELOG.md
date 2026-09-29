@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Compat mode has a service path.** `--mode supabase-compat --role-model single` now emits the
+  service escape too, keyed on the claims: a transaction whose verified `request.jwt.claims` carry
+  `"role": "service_role"` - what a Supabase service key's JWT said - passes
+  `capyrls_service_escape` on every table and skips the row filters. Before, compat mode FORCEd
+  every table and nothing bypassed the policies, so `service_role` call sites had nowhere to go. It
+  needs no roles, so it applies as a managed database role; a `service_role`-only policy is now
+  reported as covered by the escape. `--no-service-escape` still removes it. Verified on
+  postgres:18 as a role with no `SUPERUSER`, `CREATEROLE` or `BYPASSRLS`.
+- **`--target capydb` (`Options.Target = TargetCapyDB`).** Rejects `--role-model split` before
+  producing anything, with `ErrSplitRolesUnsupported` naming why: the split model creates a
+  non-owning runtime role and a `BYPASSRLS` service role, a CapyDB database role has neither
+  `CREATEROLE` nor `BYPASSRLS`, and every CapyDB login acts as the owner, so no existing role can
+  stand in. The README states the platform change that would make it possible.
+- **The report flags `SECURITY DEFINER` functions that write to FORCEd tables.** A definer runs as
+  the owner and FORCE applies policies to the owner, so the cross-user write that is usually why a
+  function is a definer fails with `42501` after conversion (or vanishes into an
+  `exception when others` handler). capyrls reads each definer's body (from the sources, or
+  `pg_proc` with `--db`) for `INSERT`/`UPDATE`/`DELETE`/`MERGE` targets, matches them against the
+  tables that end up FORCEd, and lists them under "SECURITY DEFINER functions under FORCE"
+  (`security_definer_writes` in JSON) with the fix for the configuration: raise the service escape
+  inside the body and restore it on the way out (the compat form merges the role into the claims,
+  so `auth.uid()` still names the caller), or, under the split model, hand the function to the
+  `BYPASSRLS` role. `alter function ... set app.role` is not offered: a managed role gets `42501`
+  setting a custom parameter on a function. Writes through `EXECUTE` are not seen.
+- **`cmd/capyrls-wasm`, the converter for the browser.** A `js/wasm` build that registers
+  `capyrlsConvert(sourcesJSON, optionsJSON)` with the CLI's option names and returns the files,
+  the report and its Markdown. CI builds it and runs its tests under Node. `Source` and `OutFile`
+  now carry `name`/`sql` JSON tags.
+- **Live tests.** `CAPYRLS_TEST_DATABASE_URL` runs bundles against a real Postgres as a
+  CapyDB-shaped role and checks the service path, confinement of other callers, restrictive
+  policies and the definer fix; skipped when unset.
+
+### Fixed
+
+- **The service escape now passes restrictive policies.** It is a permissive policy, and
+  restrictive policies are ANDed with everything, so a service context was still filtered by every
+  restrictive policy - `service_role`'s `BYPASSRLS` never was. When the escape is emitted (either
+  mode), it is ORed into each restrictive policy's `USING` and `WITH CHECK`.
+- **`capyrls rewrite --role-model single` no longer says a roles file creates the Supabase roles.**
+  That model emits no roles file; the warning now says the roles must exist, and that `convert`
+  needs none.
+- **The FORCE note no longer says there is no way to see every row.** The service escape is that
+  way, when it is emitted.
+
 ## [1.14.0] - 2026-09-29
 
 ### Added

@@ -71,9 +71,11 @@ verbatim. Two limits to know before choosing it:
   `service_role` as real roles. `CREATE ROLE` needs `CREATEROLE`, which a
   managed database role usually lacks (a CapyDB customer role does not have
   it). With `--role-model single` no roles are created.
-- It emits no service escape. Under `--role-model single` every table is
-  FORCEd and nothing bypasses the policies, so `service_role` call sites have
-  no path until you give them one.
+- Under `--role-model single` the service path is claims-based: the bundle
+  emits a service escape that admits a transaction whose verified claims carry
+  `"role": "service_role"` - what a Supabase service key's JWT said. Set that
+  role only from server code that used the service key, never from a token
+  your users can shape. `--no-service-escape` removes it.
 
 A reasonable first step; adopt the vanilla convention later.
 
@@ -113,9 +115,31 @@ the same change by hand.
   the tables, and this model makes that structural. Applying it needs
   `CREATEROLE`, and creating the `BYPASSRLS` role needs more privilege still.
 - `--role-model single`: for managed platforms where the app connects as the
-  table owner. Emits `FORCE ROW LEVEL SECURITY` plus, in vanilla mode, an
-  optional GUC-gated service escape (`--no-service-escape` to omit). The escape
-  adds convenience, not exposure: an owner can disable RLS anyway.
+  table owner. Emits `FORCE ROW LEVEL SECURITY` plus a service escape
+  (`--no-service-escape` to omit): `app.role = 'service'` in vanilla mode,
+  claims with `"role": "service_role"` in compat mode. The escape is also ORed
+  into every restrictive policy, because a permissive policy cannot lift a
+  restrictive one and `service_role`'s `BYPASSRLS` skipped those too. It adds
+  convenience, not exposure: an owner can disable RLS anyway.
+
+### The split model on CapyDB (`--target capydb`)
+
+`--target capydb` rejects `--role-model split` before producing anything
+(`capydb migrate rls` always sets it). The split model needs a role that does
+not own the tables, and a CapyDB database role can neither create one
+(`CREATEROLE`) nor make one bypass RLS (`BYPASSRLS`). Nor does one exist to
+grant to instead: every login CapyDB issues is a member of the owning role and
+switches to it on connect (`SET role`), so it IS the owner for row security.
+
+What it would take is a platform change, not a converter change: a second,
+platform-created login role per database that is `NOSUPERUSER NOCREATEROLE
+NOBYPASSRLS` and **not** a member of the owner, with the owner granted
+membership in it `WITH INHERIT FALSE, SET TRUE` (Postgres 16+) so one
+credential can also `SET ROLE` to it, and its own credential exposed next to
+the owner's. The owner itself would then be the service path (owners bypass
+RLS on tables that are not FORCEd), so no `BYPASSRLS` role is needed and the
+bundle's roles file becomes grants only. Until then, use the single role
+model.
 
 ## What it refuses to guess
 
@@ -126,6 +150,13 @@ mistranslated:
 - policies on Supabase-managed schemas (`storage`, `realtime`, ...)
 - function bodies referencing `auth.*` (listed for manual review)
 - deep `auth.jwt()` paths that fall back to the claims blob
+- `SECURITY DEFINER` functions that write to a table which ends up FORCEd
+  (every RLS table under the single role model). A definer runs as the owner,
+  FORCE applies policies to the owner, so the cross-user write that is usually
+  why the function is a definer now fails with `42501`. The report lists each
+  one with the fix for your configuration: raise the service escape inside the
+  body and restore it on the way out, or, under the split model, hand the
+  function to the `BYPASSRLS` role. Writes through `EXECUTE` are not seen.
 
 Run with `--strict` in CI to fail when anything needs manual attention.
 
@@ -140,6 +171,20 @@ capyrls rewrite supabase/migrations --out rewritten/
 
 rewrites `auth.*` calls in place (byte-identical everywhere else), keeps your
 `TO` clauses, and emits role stubs for `anon`/`authenticated`/`service_role`.
+
+## In the browser
+
+`cmd/capyrls-wasm` builds the converter for WebAssembly; it registers one global,
+`capyrlsConvert(sourcesJSON, optionsJSON)`, taking `[{"name", "sql"}]` and the
+CLI's options by the same names (`mode`, `role_model`, `uid_type`, `target`,
+`keep_for_all`, `no_service_escape`, `prefix`), and returns the files, the
+report and its Markdown as JSON. The CapyDB web converter at
+https://capydb.dev/tools/rls-converter runs it entirely in the page.
+
+```bash
+GOOS=js GOARCH=wasm go build -trimpath -ldflags='-s -w' -o capyrls.wasm ./cmd/capyrls-wasm
+# load it with $(go env GOROOT)/lib/wasm/wasm_exec.js from the same toolchain
+```
 
 ## Library
 
@@ -167,6 +212,17 @@ Or grab a release binary. CapyDB users get the same converter as
 
 ```bash
 make check   # fmt + vet + test
+```
+
+The live tests (`apply_live_test.go`, `live/live_test.go`) apply converted
+bundles to a real Postgres as a role with no `SUPERUSER`, `CREATEROLE` or
+`BYPASSRLS` and check who can read and write what. They are skipped unless
+`CAPYRLS_TEST_DATABASE_URL` points at a superuser connection they may create
+roles and databases with:
+
+```bash
+docker run -d --name capyrls-pg -e POSTGRES_PASSWORD=pw -p 127.0.0.1:55731:5432 postgres:18
+CAPYRLS_TEST_DATABASE_URL='postgres://postgres:pw@127.0.0.1:55731/postgres?sslmode=disable' make test
 ```
 
 ## License
