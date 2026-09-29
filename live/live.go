@@ -38,7 +38,41 @@ func Load(ctx context.Context, db *sql.DB) (*capyrls.Catalog, error) {
 	if err := loadUUIDColumns(ctx, db, cat); err != nil {
 		return nil, fmt.Errorf("introspect uuid columns: %w", err)
 	}
+	if err := loadSecurityDefiners(ctx, db, cat); err != nil {
+		return nil, fmt.Errorf("introspect security definer functions: %w", err)
+	}
 	return cat, nil
+}
+
+// loadSecurityDefiners records every SECURITY DEFINER routine with its body,
+// so the converter can name the ones that write tables it FORCEs. Overloads
+// share a name in the report, so their bodies are read together.
+func loadSecurityDefiners(ctx context.Context, db *sql.DB, cat *capyrls.Catalog) error {
+	rows, err := db.QueryContext(ctx, `
+		select n.nspname, p.proname, string_agg(p.prosrc, E'\n;\n' order by p.oid)
+		from pg_catalog.pg_proc p
+		join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+		where p.prosecdef
+		  and p.prokind in ('f', 'p')
+		  and n.nspname not in (
+		    'pg_catalog', 'information_schema', 'auth', 'storage', 'realtime',
+		    'vault', 'graphql', 'graphql_public', 'extensions', 'pgsodium',
+		    'pgsodium_masks', 'supabase_functions', 'net', 'cron', 'pgbouncer'
+		  )
+		group by n.nspname, p.proname
+		order by n.nspname, p.proname`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var schema, name, body string
+		if err := rows.Scan(&schema, &name, &body); err != nil {
+			return err
+		}
+		cat.AddSecurityDefiner(capyrls.QName{Schema: schema, Name: name}, body, "database")
+	}
+	return rows.Err()
 }
 
 // loadUUIDColumns records every uuid column. The converter only asks whether a
