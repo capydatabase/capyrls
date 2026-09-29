@@ -2,3 +2,4 @@
 /dist
 /capyrls_out
 .DS_Store
+/capyrls.wasm

@@ -387,10 +387,18 @@ func emitPrelude(opts Options, rw *rewriter) string {
 -- keyed on identity fail closed. auth.role() falls back to 'anon', which is
 -- what TO anon policies were written against, so those still apply to a
 -- caller with no token - exactly as on Supabase.
-
+`, uidPlaceholder)
+		if emitsServiceEscape(opts) {
+			b.WriteString(`--
+-- Service context (was the service key): claims with "role":"service_role"
+-- pass the service escape in capyrls_02_force_rls.sql and skip the row
+-- filters. Set it only from server code that held the service key.
+`)
+		}
+		b.WriteString(`
 create schema if not exists auth;
 
-`, uidPlaceholder)
+`)
 		writeSQLFunction(&b, "", "auth.jwt", "jsonb",
 			"select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb")
 		writeSQLFunction(&b, "", "auth.uid", uidReturns,
@@ -585,8 +593,9 @@ const forceForeignKeyNote = `
 --
 -- One more consequence of FORCE, while you are here: as the owner you now have
 -- NO privileged view of your own tables. A count is what your policies admit,
--- not what the table holds. There is no service_role to fall back on - that is
--- the point of the single-role model, not a gap in it.
+-- not what the table holds. The service escape below (unless you turned it
+-- off) is the one way to see everything: count inside a transaction that
+-- raises it.
 -- ---------------------------------------------------------------------------
 
 `
@@ -605,28 +614,36 @@ func emitSingleRole(opts Options, tables []QName, compatRoles []string) string {
 		fmt.Fprintf(&b, "alter table %s force row level security;\n", t)
 	}
 	b.WriteString(forceForeignKeyNote)
-	if !opts.NoServiceEscape && opts.Mode == ModeVanilla {
-		p := opts.Prefix
-		fmt.Fprintf(&b, `
+	if emitsServiceEscape(opts) {
+		escape := serviceEscapePredicate(opts)
+		if opts.Mode == ModeCompat {
+			b.WriteString(`
+-- Service escape hatch (was service_role): a transaction whose verified claims
+-- carry "role": "service_role" skips the row filters - the call sites that
+-- used Supabase's service key (seeds, backfills, admin jobs, webhooks). Set
+-- that role only from code that held the service key: never copy a role
+-- claim from a token your users can shape. The connecting role owns these
+-- tables and could ALTER ... DISABLE ROW LEVEL SECURITY anyway, so this adds
+-- convenience, not new exposure. Restrictive policies carry the same check
+-- (see capyrls_03_policies.sql), as BYPASSRLS skipped them too.
+`)
+		} else {
+			fmt.Fprintf(&b, `
 -- Service escape hatch: a transaction that sets %s.role = 'service' skips the
 -- row filters (seeds, backfills, admin jobs). The connecting role owns these
 -- tables and could ALTER ... DISABLE ROW LEVEL SECURITY anyway, so this adds
--- convenience, not new exposure. Remove it if you split roles later.
-`, p)
+-- convenience, not new exposure. Restrictive policies carry the same check
+-- (see capyrls_03_policies.sql). Remove it if you split roles later.
+`, opts.Prefix)
+		}
 		for _, t := range tables {
-			// NOT wrapped in `(select ...)`. This policy sits on the same table as
-			// the app's own, and a sublink in ANY policy on a table is enough for
-			// Postgres's static recursion check to reject a sibling policy that
-			// reaches that table - verified on postgres:17, where adding this
-			// escape turned a working insert into "infinite recursion detected in
-			// policy". is_service() only reads a GUC, so the initplan bought
-			// almost nothing and cost correctness for the whole table.
+			// Unwrapped - see serviceEscapePredicate.
 			fmt.Fprintf(&b, `drop policy if exists capyrls_service_escape on %s;
 create policy capyrls_service_escape on %s
   for all
-  using (%s.is_service())
-  with check (%s.is_service());
-`, t, t, p, p)
+  using (%s)
+  with check (%s);
+`, t, t, escape, escape)
 		}
 	}
 	if len(compatRoles) > 0 {

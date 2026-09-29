@@ -91,6 +91,9 @@ type Catalog struct {
 	Defaults []ColumnDefault
 	Routines []Routine
 	Notes    []string
+	// Definers are the SECURITY DEFINER routines and the tables their bodies
+	// write, in their final state (see definer.go).
+	Definers []SecurityDefiner
 	// ColumnTypes maps "schema.table.column" to the column's leading type
 	// name, lower-cased ("uuid", "text", "uuid[]"). It is only ever compared
 	// against "uuid" - to find the columns --uid-type text breaks - so it may

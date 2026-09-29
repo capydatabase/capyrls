@@ -40,6 +40,8 @@ Common flags:
   --prefix NAME                    Schema/GUC namespace (default app)
   --uid-type uuid|text             Type the user-id accessor returns (default uuid);
                                    text for non-uuid subjects such as Clerk's user_...
+  --target postgres|capydb         Platform the bundle is for (default postgres);
+                                   capydb rejects the split role model up front
   --out DIR                        Output directory (default capyrls_out)
   --stdout                         Print SQL to stdout instead of writing files
   --json                           Also emit capyrls_report.json
@@ -65,6 +67,7 @@ type commonFlags struct {
 	appRole         string
 	serviceRole     string
 	uidType         string
+	target          string
 	out             string
 	stdout          bool
 	jsonOut         bool
@@ -80,6 +83,7 @@ func (cf *commonFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&cf.appRole, "app-role", "app_user", "runtime role name (split role model)")
 	fs.StringVar(&cf.serviceRole, "service-role", "app_service", "service role name (split role model)")
 	fs.StringVar(&cf.uidType, "uid-type", "uuid", "type the user-id accessor returns: uuid, or text for non-uuid subjects (Clerk user_... ids)")
+	fs.StringVar(&cf.target, "target", "postgres", "platform the bundle is for: postgres, or capydb (no role creation)")
 	fs.StringVar(&cf.out, "out", "capyrls_out", "output directory")
 	fs.BoolVar(&cf.stdout, "stdout", false, "print SQL to stdout instead of writing files")
 	fs.BoolVar(&cf.jsonOut, "json", false, "also emit capyrls_report.json")
@@ -117,6 +121,14 @@ func (cf *commonFlags) options() (capyrls.Options, error) {
 		opts.UIDType = capyrls.UIDText
 	default:
 		return opts, fmt.Errorf("unknown --uid-type %q (uuid or text)", cf.uidType)
+	}
+	switch cf.target {
+	case "postgres":
+		opts.Target = capyrls.TargetPostgres
+	case "capydb":
+		opts.Target = capyrls.TargetCapyDB
+	default:
+		return opts, fmt.Errorf("unknown --target %q (postgres or capydb)", cf.target)
 	}
 	return opts, nil
 }

@@ -21,13 +21,15 @@
 package capyrls
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 )
 
 // Version is the capyrls release version.
-const Version = "1.14.0"
+const Version = "1.15.0"
 
 // Mode selects the output convention.
 type Mode int
@@ -88,6 +90,41 @@ func (u UIDType) String() string {
 	return "uuid"
 }
 
+// Target names the platform the bundle will be applied to. The converter's
+// SQL is platform-neutral; the target only rejects configurations that
+// cannot be applied there, before any output is produced.
+type Target int
+
+const (
+	// TargetPostgres is any Postgres where the applying role may create roles
+	// (self-managed, or a managed service that grants CREATEROLE).
+	TargetPostgres Target = iota
+	// TargetCapyDB is a CapyDB database. Its database role owns the tables and
+	// has neither SUPERUSER, CREATEROLE nor BYPASSRLS, and every login role the
+	// platform issues acts as that owner (`SET role` on connect). No role that
+	// does not own the tables exists or can be created.
+	TargetCapyDB
+)
+
+func (t Target) String() string {
+	if t == TargetCapyDB {
+		return "capydb"
+	}
+	return "postgres"
+}
+
+// ErrSplitRolesUnsupported is returned for the split role model on a target
+// that cannot create roles (TargetCapyDB). The split model is two roles the
+// bundle creates: a runtime role that does not own the tables, and a service
+// role that bypasses RLS. On CapyDB the database role can do neither, and no
+// non-owning role exists for the bundle to grant to instead, so the bundle
+// would stop at its first CREATE ROLE. Use the single role model.
+var ErrSplitRolesUnsupported = errors.New(
+	"the split role model cannot be applied on CapyDB: it creates a runtime role that does not own your tables " +
+		"and a BYPASSRLS service role, and a CapyDB database role has neither CREATEROLE nor BYPASSRLS " +
+		"(and every CapyDB login acts as the owner, so there is no existing non-owning role to use instead); " +
+		"use --role-model single, which FORCEs row security on the owner and needs no roles")
+
 // Options control a conversion. The zero value is the recommended setup:
 // vanilla mode, role-split model, FOR ALL policies split per command, service
 // escape enabled for the single-role model.
@@ -107,6 +144,16 @@ type Options struct {
 	ServiceRole string
 	// UIDType is the user-id accessor's return type, default uuid.
 	UIDType UIDType
+	// Target is the platform the bundle is for, default any Postgres.
+	Target Target
+}
+
+// check rejects option combinations the target cannot apply.
+func (o Options) check() error {
+	if o.Target == TargetCapyDB && o.RoleModel == RoleSplit {
+		return ErrSplitRolesUnsupported
+	}
+	return nil
 }
 
 func (o Options) withDefaults() Options {
@@ -124,14 +171,14 @@ func (o Options) withDefaults() Options {
 
 // Source is one SQL input (a file, a dump, stdin).
 type Source struct {
-	Name string
-	SQL  string
+	Name string `json:"name"`
+	SQL  string `json:"sql"`
 }
 
 // OutFile is one produced file.
 type OutFile struct {
-	Name string
-	SQL  string
+	Name string `json:"name"`
+	SQL  string `json:"sql"`
 }
 
 // Result is a finished conversion.
@@ -153,6 +200,9 @@ func Convert(sources []Source, opts Options) (*Result, error) {
 // ConvertCatalog converts an already-built catalog (see ParseSQL and the
 // live subpackage).
 func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
+	if err := opts.check(); err != nil {
+		return nil, err
+	}
 	opts = opts.withDefaults()
 	dialect := dialectVanilla
 	if opts.Mode == ModeCompat {
@@ -289,6 +339,24 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 			}
 		}
 
+		// A permissive escape cannot lift a restrictive policy: restrictive
+		// policies are ANDed with everything, so the service path would still be
+		// filtered by them - verified on postgres:18, where a service-context
+		// insert failed on a restrictive policy alone. Supabase's service_role
+		// had BYPASSRLS, which skips restrictive policies too, so the escape is
+		// ORed into each one to keep that.
+		escapedRestrictive := false
+		if !p.Permissive && emitsServiceEscape(opts) {
+			escape := serviceEscapePredicate(opts)
+			if using != "" {
+				using = escape + " or (" + using + ")"
+			}
+			if check != "" {
+				check = escape + " or (" + check + ")"
+			}
+			escapedRestrictive = true
+		}
+
 		base := renderedPolicy{
 			Name: p.Name, Table: p.Table, Permissive: p.Permissive,
 			Cmd: p.Cmd, Targets: analysis.targets, Using: using, WithCheck: check,
@@ -298,6 +366,14 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 		if p.Cmd == CmdAll && !opts.NoSplitAll && opts.Mode == ModeVanilla {
 			rendered = splitAll(base)
 			detail = "FOR ALL split into per-command policies"
+		}
+		if escapedRestrictive {
+			note := "restrictive: the service escape is ORed in so the service path still passes it, as BYPASSRLS did"
+			if detail != "" {
+				detail += "; " + note
+			} else {
+				detail = note
+			}
 		}
 		helpers := dedupe(append(
 			exprRoutineCalls(p.Using, reviewedRoutines, reviewedByName),
@@ -440,6 +516,25 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 	}
 	files = append(files, OutFile{Name: "capyrls_03_policies.sql", SQL: body.String()})
 
+	// Tables that are FORCEd once the bundle is applied: every RLS table under
+	// the single role model, plus any the source already FORCEd.
+	forced := map[string]QName{}
+	if opts.RoleModel == RoleSingle {
+		maps.Copy(forced, rlsTables)
+	}
+	for _, t := range cat.sortedTables() {
+		if t.RLSEnabled && t.RLSForced && !supabaseManagedSchemas[t.Name.EffectiveSchema()] {
+			forced[t.Name.Key()] = t.Name
+		}
+	}
+	rep.DefinerWrites = definerWrites(cat, forced)
+	if len(rep.DefinerWrites) > 0 {
+		rep.DefinerFix = definerFix(opts)
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+			"%d SECURITY DEFINER function(s) write to tables that are FORCEd, so they no longer bypass row security - writes the caller's policies do not admit now fail (see SECURITY DEFINER functions under FORCE for the list and the fix)",
+			len(rep.DefinerWrites)))
+	}
+
 	rep.Claims = rw.sortedClaims()
 	rep.GUCs = buildGUCContract(opts, rw)
 	rep.Warnings = append(rep.Warnings, rw.warnings...)
@@ -449,6 +544,9 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 	rep.Warnings = dedupe(rep.Warnings)
 	if rep.Defaults == nil {
 		rep.Defaults = []string{}
+	}
+	if rep.DefinerWrites == nil {
+		rep.DefinerWrites = []DefinerWrite{}
 	}
 	if rep.Routines == nil {
 		rep.Routines = []string{}
@@ -474,6 +572,9 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 // to keep an existing migration history instead of adopting a fresh bundle.
 // The returned files mirror the inputs, plus the prelude and report.
 func Rewrite(sources []Source, opts Options) (*Result, error) {
+	if err := opts.check(); err != nil {
+		return nil, err
+	}
 	opts = opts.withDefaults()
 	cat, err := ParseSQL(sources)
 	if err != nil {
@@ -531,9 +632,18 @@ func Rewrite(sources []Source, opts Options) (*Result, error) {
 	}
 	sort.Strings(sortedCompatRoles)
 	if len(sortedCompatRoles) > 0 {
+		msg := "capyrls_02_roles.sql creates them as membership roles"
+		if opts.RoleModel == RoleSingle {
+			// No roles file under the single role model: rewrite keeps the TO
+			// clauses, so the roles have to exist before the files apply.
+			msg = "rewrite keeps TO clauses as written and the single role model creates no roles, so they must exist before these files apply - `convert` renders them as predicates instead and needs no roles"
+			if opts.Target == TargetCapyDB {
+				msg += " (on CapyDB it is the only option: a CapyDB database role cannot create roles)"
+			}
+		}
 		rep.Warnings = append(rep.Warnings, fmt.Sprintf(
-			"policies reference the Supabase role(s) %s in TO clauses; capyrls_02_roles.sql creates them as membership roles",
-			strings.Join(sortedCompatRoles, ", ")))
+			"policies reference the Supabase role(s) %s in TO clauses; %s",
+			strings.Join(sortedCompatRoles, ", "), msg))
 	}
 
 	files = append(files, OutFile{Name: "capyrls_01_prelude.sql", SQL: emitPrelude(opts, rw)})
@@ -557,6 +667,9 @@ func Rewrite(sources []Source, opts Options) (*Result, error) {
 	if rep.Defaults == nil {
 		rep.Defaults = []string{}
 	}
+	if rep.DefinerWrites == nil {
+		rep.DefinerWrites = []DefinerWrite{}
+	}
 	if rep.Routines == nil {
 		rep.Routines = []string{}
 	}
@@ -572,10 +685,11 @@ func Rewrite(sources []Source, opts Options) (*Result, error) {
 
 func buildGUCContract(opts Options, rw *rewriter) []GUCSpec {
 	if opts.Mode == ModeCompat {
-		return []GUCSpec{{
-			Name: "request.jwt.claims", Type: "json (text GUC)",
-			Description: fmt.Sprintf("the verified JWT claims; must include `sub`, read by `auth.uid()` as %s (and `role`/`email` where policies use them)", opts.UIDType),
-		}}
+		desc := fmt.Sprintf("the verified JWT claims; must include `sub`, read by `auth.uid()` as %s (and `role`/`email` where policies use them)", opts.UIDType)
+		if emitsServiceEscape(opts) {
+			desc += "; `\"role\": \"service_role\"` activates the service escape - set it only for calls that used the service key"
+		}
+		return []GUCSpec{{Name: "request.jwt.claims", Type: "json (text GUC)", Description: desc}}
 	}
 	p := opts.Prefix
 	userIDType := "uuid (text GUC)"
@@ -626,10 +740,28 @@ func dedupe(in []string) []string {
 	return out
 }
 
-// emitsServiceEscape reports whether the output carries the GUC-gated service
-// escape, the single role model's only service path. It is emitted in vanilla
-// mode unless --no-service-escape; compat mode never emits it, so a report or
-// helper that assumes the escape exists there describes access that is gone.
+// emitsServiceEscape reports whether the output carries the service escape,
+// the single role model's only service path: emitted unless
+// --no-service-escape, in both modes.
 func emitsServiceEscape(opts Options) bool {
-	return opts.RoleModel == RoleSingle && opts.Mode == ModeVanilla && !opts.NoServiceEscape
+	return opts.RoleModel == RoleSingle && !opts.NoServiceEscape
+}
+
+// serviceEscapePredicate is the condition that admits the service path.
+//
+// Vanilla: the app declares a service context with <prefix>.role = 'service'.
+// Compat: the verified claims carry role = service_role, which is exactly what
+// a Supabase service key's JWT says - the call sites that used the service key
+// keep working once the app sets those claims for them.
+//
+// NOT wrapped in `(select ...)`: the escape sits on the same tables as the
+// app's own policies, and a sublink in any policy on a table is enough for
+// Postgres's static recursion check to reject a sibling policy that reaches
+// that table (verified on postgres:17). It only reads a GUC, so the initplan
+// would buy almost nothing.
+func serviceEscapePredicate(opts Options) string {
+	if opts.Mode == ModeCompat {
+		return "auth.role() = '" + roleService + "'"
+	}
+	return opts.Prefix + ".is_service()"
 }
