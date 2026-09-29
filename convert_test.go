@@ -2,6 +2,7 @@ package capyrls
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -711,23 +712,174 @@ create policy docs_unlocked on public.docs as restrictive for update to authenti
 	}
 }
 
-// The split role model creates roles; CapyDB's database role cannot, so the
-// conversion refuses up front instead of producing a bundle that stops at its
-// first CREATE ROLE.
-func TestTargetCapyDBRejectsSplitRoles(t *testing.T) {
+// On CapyDB the split model runs as the platform's runtime role, app_user. A
+// custom runtime role would have to be created, which a CapyDB database role
+// cannot do, so the conversion refuses it up front.
+func TestTargetCapyDBSplitNeedsThePlatformAppRole(t *testing.T) {
 	for _, mode := range []Mode{ModeVanilla, ModeCompat} {
-		if _, err := Convert(fixture, Options{Mode: mode, RoleModel: RoleSplit, Target: TargetCapyDB}); !errors.Is(err, ErrSplitRolesUnsupported) {
-			t.Errorf("mode=%v convert: err = %v, want ErrSplitRolesUnsupported", mode, err)
+		for _, appRole := range []string{"", "app_user"} {
+			opts := Options{Mode: mode, RoleModel: RoleSplit, Target: TargetCapyDB, AppRole: appRole}
+			if _, err := Convert(fixture, opts); err != nil {
+				t.Errorf("mode=%v app role %q convert: %v", mode, appRole, err)
+			}
+			if _, err := Rewrite(fixture, opts); err != nil {
+				t.Errorf("mode=%v app role %q rewrite: %v", mode, appRole, err)
+			}
 		}
-		if _, err := Rewrite(fixture, Options{Mode: mode, RoleModel: RoleSplit, Target: TargetCapyDB}); !errors.Is(err, ErrSplitRolesUnsupported) {
-			t.Errorf("mode=%v rewrite: err = %v, want ErrSplitRolesUnsupported", mode, err)
+		custom := Options{Mode: mode, RoleModel: RoleSplit, Target: TargetCapyDB, AppRole: "web_runtime"}
+		if _, err := Convert(fixture, custom); !errors.Is(err, ErrSplitRolesUnsupported) || !strings.Contains(err.Error(), "web_runtime") {
+			t.Errorf("mode=%v custom app role convert: err = %v, want ErrSplitRolesUnsupported naming the role", mode, err)
 		}
-		if _, err := Convert(fixture, Options{Mode: mode, RoleModel: RoleSingle, Target: TargetCapyDB}); err != nil {
+		if _, err := Rewrite(fixture, custom); !errors.Is(err, ErrSplitRolesUnsupported) {
+			t.Errorf("mode=%v custom app role rewrite: err = %v, want ErrSplitRolesUnsupported", mode, err)
+		}
+		// A custom runtime role is fine anywhere the bundle may create it, and
+		// under the single role model, which has no runtime role at all.
+		if _, err := Convert(fixture, Options{Mode: mode, RoleModel: RoleSplit, AppRole: "web_runtime"}); err != nil {
+			t.Errorf("mode=%v custom app role on postgres: %v", mode, err)
+		}
+		if _, err := Convert(fixture, Options{Mode: mode, RoleModel: RoleSingle, Target: TargetCapyDB, AppRole: "web_runtime"}); err != nil {
 			t.Errorf("mode=%v single on capydb: %v", mode, err)
 		}
 	}
-	if _, err := Convert(fixture, Options{RoleModel: RoleSplit}); err != nil {
-		t.Errorf("split on generic postgres must still work: %v", err)
+}
+
+// liveSQL drops comment lines: the bundle quotes skipped originals and advice
+// inside comments, and only statements count.
+func liveSQL(sql string) string {
+	var b strings.Builder
+	for line := range strings.SplitSeq(sql, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+	return b.String()
+}
+
+// Split on CapyDB creates no roles: the runtime role is the platform's (the
+// roles file checks it exists) and the owner is the service path, so nothing
+// is granted to a service role and no Supabase role is recreated.
+func TestConvertSplitOnCapyDB(t *testing.T) {
+	anonSource := append(append([]Source{}, fixture...), Source{Name: "0003_anon.sql", SQL: `
+create policy anon_browse on public.todos
+  for select to anon using (not archived);
+`})
+	for _, mode := range []Mode{ModeVanilla, ModeCompat} {
+		res, err := Convert(anonSource, Options{Mode: mode, RoleModel: RoleSplit, Target: TargetCapyDB, ServiceRole: "ignored_service"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range res.Files {
+			sql := strings.ToLower(liveSQL(f.SQL))
+			if strings.Contains(sql, "create role") || strings.Contains(sql, "bypassrls") {
+				t.Errorf("mode=%v: %s creates a role; a CapyDB database role cannot", mode, f.Name)
+			}
+			for _, unwanted := range []string{"app_service", "ignored_service", "service_role", "to anon", "to authenticated"} {
+				if strings.Contains(sql, unwanted) {
+					t.Errorf("mode=%v: %s references %q", mode, f.Name, unwanted)
+				}
+			}
+		}
+
+		roles := findFile(t, res, "capyrls_02_roles.sql")
+		contextSchema := "app"
+		if mode == ModeCompat {
+			contextSchema = "auth"
+		}
+		for _, want := range []string{
+			"if not exists (select from pg_catalog.pg_roles where rolname = 'app_user') then",
+			"raise exception 'role \"app_user\" does not exist: enable the runtime role for this project first",
+			"POST /v1/projects/<project id>/roles/app",
+			"grant usage on schema " + contextSchema + " to app_user;",
+			"grant usage on schema public to app_user;",
+			"grant select, insert, update, delete on all tables in schema public to app_user;",
+			"grant usage, select on all sequences in schema public to app_user;",
+			"alter default privileges in schema public grant select, insert, update, delete on tables to app_user;",
+			"alter default privileges in schema public grant usage, select on sequences to app_user;",
+		} {
+			if !strings.Contains(roles, want) {
+				t.Errorf("mode=%v: CapyDB roles file missing %q", mode, want)
+			}
+		}
+		if strings.Contains(strings.ToLower(liveSQL(roles)), "for role") {
+			t.Errorf("mode=%v: default privileges must apply to the applying owner, not FOR ROLE another", mode)
+		}
+		if slices.Contains(fileNames(res), "capyrls_02_force_rls.sql") {
+			t.Errorf("mode=%v: the split model must not FORCE row security", mode)
+		}
+
+		// Policies target the runtime role; anon/authenticated survive as
+		// predicates rather than as roles.
+		policies := liveSQL(findFile(t, res, "capyrls_03_policies.sql"))
+		authed, anon := "(select app.user_id()) is not null", "(select app.user_id()) is null"
+		if mode == ModeCompat {
+			authed, anon = "auth.role() = 'authenticated'", "auth.role() = 'anon'"
+		}
+		for _, want := range []string{"to app_user", authed, anon} {
+			if !strings.Contains(policies, want) {
+				t.Errorf("mode=%v: policies missing %q", mode, want)
+			}
+		}
+		if skipped := outcomeFor(t, res.Report, "admin_all"); skipped.Status != "skipped" || !strings.Contains(skipped.Detail, "the service path is the owner") {
+			t.Errorf("mode=%v: service-only policy outcome = %+v; want a skip naming the owner as the service path", mode, skipped)
+		}
+	}
+}
+
+// A table the source already FORCEd confines the owner too, so on CapyDB the
+// split model's service path - the owner - is filtered there, and so is a
+// definer the owner owns. The report says so and gives the CapyDB fix, not the
+// BYPASSRLS-role one.
+func TestSplitOnCapyDBFlagsForcedTables(t *testing.T) {
+	src := []Source{{Name: "a.sql", SQL: `
+create table public.todos (id int, owner_id uuid);
+alter table public.todos enable row level security;
+alter table public.todos force row level security;
+create policy own on public.todos for all to authenticated using (auth.uid() = owner_id);
+create function public.gift(r uuid) returns void language plpgsql security definer as $$
+begin insert into public.todos (owner_id) values (r); end $$;
+`}}
+	res, err := Convert(src, Options{RoleModel: RoleSplit, Target: TargetCapyDB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := warningContaining(res.Report, "FORCEd in the source"); !strings.Contains(w, "public.todos") || !strings.Contains(w, "no force row level security") {
+		t.Errorf("forced-table warning = %q", w)
+	}
+	if len(res.Report.DefinerWrites) != 1 {
+		t.Fatalf("definer writes = %+v", res.Report.DefinerWrites)
+	}
+	fix := res.Report.DefinerFix
+	if !strings.Contains(fix, "no force row level security") || strings.Contains(fix, "alter function") || strings.Contains(fix, "app_service") {
+		t.Errorf("CapyDB split definer fix = %q", fix)
+	}
+	// Elsewhere the split model still hands definers to its BYPASSRLS role.
+	res, err = Convert(src, Options{RoleModel: RoleSplit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Report.DefinerFix, "owner to app_service") {
+		t.Errorf("postgres split definer fix = %q", res.Report.DefinerFix)
+	}
+	if w := warningContaining(res.Report, "FORCEd in the source"); w != "" {
+		t.Errorf("the forced-table warning is CapyDB-only, got %q", w)
+	}
+}
+
+// Rewrite keeps TO clauses, and the CapyDB roles file cannot create the
+// Supabase roles they name.
+func TestRewriteSplitOnCapyDBSaysRolesCannotBeCreated(t *testing.T) {
+	res, err := Rewrite(fixture, Options{Mode: ModeCompat, RoleModel: RoleSplit, Target: TargetCapyDB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := warningContaining(res.Report, "TO clauses")
+	if strings.Contains(w, "creates them") || !strings.Contains(w, "cannot create") || !strings.Contains(w, "convert") {
+		t.Errorf("rewrite split-on-CapyDB warning = %q", w)
+	}
+	if roles := liveSQL(findFile(t, res, "capyrls_02_roles.sql")); strings.Contains(strings.ToLower(roles), "create role") {
+		t.Error("the CapyDB roles file must not create roles in rewrite mode either")
 	}
 }
 

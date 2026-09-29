@@ -91,8 +91,11 @@ func analyzeRoles(p *Policy, opts Options, rw *rewriter, selfRef bool) roleAnaly
 	// the role targets become predicates on auth.role(), exactly as vanilla
 	// does. That is also the more faithful reading: membership grants make an
 	// anon-only policy apply to authenticated sessions too, which a predicate
-	// does not.
-	if opts.Mode == ModeCompat && opts.RoleModel == RoleSplit {
+	// does not. The split model on CapyDB takes the predicate path too, for the
+	// same reason: the database role cannot create the Supabase roles, so the
+	// policies target the platform's runtime role and keep the anon /
+	// authenticated distinction as auth.role() predicates.
+	if opts.Mode == ModeCompat && opts.RoleModel == RoleSplit && !opts.splitOnCapyDB() {
 		var targets []string
 		if hasPublic {
 			targets = nil
@@ -122,6 +125,9 @@ func analyzeRoles(p *Policy, opts Options, rw *rewriter, selfRef bool) roleAnaly
 	// Vanilla: role names become predicates on the session context.
 	if hasService && !hasPublic && !hasAnon && !hasAuthed && len(custom) == 0 {
 		res.skip = "applies only to service_role; the service path (BYPASSRLS role or service escape) already bypasses RLS"
+		if opts.splitOnCapyDB() {
+			res.skip = "applies only to service_role; on CapyDB the service path is the owner, which bypasses RLS on tables that are not FORCEd"
+		}
 		if opts.RoleModel == RoleSingle && !emitsServiceEscape(opts) {
 			// Skipping is still right - there is no role to target - but saying
 			// "already bypasses RLS" would be false: this configuration has no
@@ -463,6 +469,9 @@ create schema if not exists %s;
 // emitRolesSplit renders the runtime/service role setup for the role-split
 // model.
 func emitRolesSplit(opts Options, schemas []string, compatRoles []string) string {
+	if opts.splitOnCapyDB() {
+		return emitRolesCapyDB(opts, schemas)
+	}
 	var b strings.Builder
 	b.WriteString(fileHeader("Role separation: the runtime role never owns tables, so RLS actually applies."))
 	appRole := opts.AppRole
@@ -496,21 +505,7 @@ $$;
 `, role.name, QuoteIdent(role.name), role.attrs)
 	}
 
-	grantees := QuoteIdent(appRole) + ", " + QuoteIdent(svcRole)
-	if opts.Mode == ModeVanilla {
-		fmt.Fprintf(&b, "grant usage on schema %s to %s;\n", QuoteIdent(opts.Prefix), grantees)
-	} else {
-		fmt.Fprintf(&b, "grant usage on schema auth to %s;\n", grantees)
-	}
-	for _, schema := range schemas {
-		s := QuoteIdent(schema)
-		fmt.Fprintf(&b, `grant usage on schema %s to %s;
-grant select, insert, update, delete on all tables in schema %s to %s;
-grant usage, select on all sequences in schema %s to %s;
-alter default privileges in schema %s grant select, insert, update, delete on tables to %s;
-alter default privileges in schema %s grant usage, select on sequences to %s;
-`, s, grantees, s, grantees, s, grantees, s, grantees, s, grantees)
-	}
+	writeGrants(&b, opts, QuoteIdent(appRole)+", "+QuoteIdent(svcRole), schemas)
 
 	if len(compatRoles) > 0 {
 		b.WriteString(`
@@ -536,6 +531,69 @@ $$;
 			}
 		}
 	}
+	return b.String()
+}
+
+// writeGrants grants the context schema (the prefix schema, or auth in compat
+// mode) and every table and sequence in the policy schemas to grantees, now and
+// by default for objects the applying role creates later. `alter default
+// privileges` without FOR ROLE covers objects created by the role that runs it:
+// apply the bundle as the role that runs your migrations.
+func writeGrants(b *strings.Builder, opts Options, grantees string, schemas []string) {
+	if opts.Mode == ModeVanilla {
+		fmt.Fprintf(b, "grant usage on schema %s to %s;\n", QuoteIdent(opts.Prefix), grantees)
+	} else {
+		fmt.Fprintf(b, "grant usage on schema auth to %s;\n", grantees)
+	}
+	for _, schema := range schemas {
+		s := QuoteIdent(schema)
+		fmt.Fprintf(b, `grant usage on schema %s to %s;
+grant select, insert, update, delete on all tables in schema %s to %s;
+grant usage, select on all sequences in schema %s to %s;
+alter default privileges in schema %s grant select, insert, update, delete on tables to %s;
+alter default privileges in schema %s grant usage, select on sequences to %s;
+`, s, grantees, s, grantees, s, grantees, s, grantees, s, grantees)
+	}
+}
+
+// emitRolesCapyDB renders the split model's roles file for CapyDB, where the
+// database role can create no roles. The runtime role is the one the platform
+// creates when a project enables it; the file checks it exists and grants to
+// it. There is no service role: the owner - the role applying this file, which
+// runs migrations and trusted server code - bypasses row security on tables
+// that are not FORCEd, which is what BYPASSRLS gave service_role. Nor are the
+// Supabase roles recreated: under this configuration policies target the
+// runtime role and test auth.role() instead (see analyzeRoles).
+func emitRolesCapyDB(opts Options, schemas []string) string {
+	var b strings.Builder
+	b.WriteString(fileHeader("Role separation on CapyDB: grants to the platform's runtime role, which never owns tables, so RLS applies."))
+	appRole := opts.AppRole
+	fmt.Fprintf(&b, `-- %[1]s: the runtime role CapyDB creates when the project enables it
+-- (POST /v1/projects/<project id>/roles/app). It owns nothing, is not a member
+-- of the owner and cannot bypass RLS. Connect as it with its own credential,
+-- or keep the owner's credential and switch inside each transaction:
+--   begin; set local role %[1]s; ... commit;
+-- (a session-level SET ROLE behind a transaction pooler outlives your
+-- transaction and reaches the next client of that server connection).
+--
+-- The owner - the role that applies this file and runs your migrations - is
+-- the service path (was service_role): owners bypass row security on tables
+-- that are not FORCEd. Keep its credential on the server, for migrations,
+-- backfills and admin jobs, and send request traffic through %[1]s.
+--
+-- No role is created here: a CapyDB database role cannot create roles.
+
+do $$
+begin
+  if not exists (select from pg_catalog.pg_roles where rolname = '%[2]s') then
+    raise exception 'role "%[2]s" does not exist: enable the runtime role for this project first, then apply this bundle again'
+      using hint = 'POST /v1/projects/<project id>/roles/app with an API key that has projects:write (Postgres 16 or newer). Or convert with --role-model single, which needs no second role.';
+  end if;
+end;
+$$;
+
+`, QuoteIdent(appRole), appRole)
+	writeGrants(&b, opts, QuoteIdent(appRole), schemas)
 	return b.String()
 }
 

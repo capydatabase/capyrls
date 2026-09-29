@@ -25,7 +25,8 @@ func TestConvertMirrorsTheCLIOptions(t *testing.T) {
 		t.Error("markdown report missing")
 	}
 
-	if res := convert(sources, `{"role_model":"split","target":"capydb"}`); !strings.Contains(res.Error, "split role model cannot be applied on CapyDB") {
+	// Split on capydb grants to the platform's runtime role and creates none.
+	if res := convert(sources, `{"role_model":"split","target":"capydb"}`); res.Error != "" || !strings.Contains(res.Files[1].SQL, "grant usage on schema public to app_user;") || strings.Contains(res.Files[1].SQL, "create role ") {
 		t.Errorf("split on capydb: error = %q", res.Error)
 	}
 	if res := convert(sources, `{"mode":"nope"}`); !strings.Contains(res.Error, "unknown mode") {

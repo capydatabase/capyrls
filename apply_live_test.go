@@ -312,3 +312,221 @@ func TestLiveFunctionSetNeedsParameterPrivilege(t *testing.T) {
 		t.Errorf("alter function set app.role as a non-superuser: err = %v, want 42501", err)
 	}
 }
+
+// liveAnonPolicy is a public-read policy for callers with no token, so the
+// split-on-CapyDB test carries both Supabase roles the bundle cannot create.
+const liveAnonPolicy = `
+create policy todos_public on public.todos for select to anon using (title = 'public');
+`
+
+// livePlatformAppRole creates CapyDB's runtime role the way the platform does
+// for a project that enables it - the ensure SQL of the infrastructure
+// template capydb-app-role.sh.j2, run as the superuser: a login that owns
+// nothing and cannot bypass RLS, the owner a member of it WITH INHERIT FALSE,
+// SET TRUE (it can SET ROLE to it but gains none of its privileges), CONNECT
+// and TEMPORARY on the database, which is revoked from PUBLIC as
+// instance-create does. The role is server-wide, so it is dropped first and
+// after the test (register this before the database's cleanup runs, i.e.
+// call it after liveCustomerDB).
+func livePlatformAppRole(t *testing.T, admin *sql.DB, owner, dbName string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, stmt := range []string{
+		"drop role if exists app_user",
+		"create role app_user",
+		"alter role app_user login nosuperuser nocreatedb nocreaterole noreplication nobypassrls inherit password 'app-pw' valid until 'infinity'",
+		fmt.Sprintf("grant app_user to %s with inherit false, set true", owner),
+		fmt.Sprintf("revoke all on database %s from public", dbName),
+		fmt.Sprintf("grant connect, temporary on database %s to app_user", dbName),
+	} {
+		if _, err := admin.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+}
+
+// liveDSNAs is the admin DSN with another login and database.
+func liveDSNAs(t *testing.T, adminDSN, user, password, dbName string) string {
+	t.Helper()
+	u, err := url.Parse(adminDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword(user, password)
+	u.Path = "/" + dbName
+	return u.String()
+}
+
+// The split model on CapyDB: the bundle creates no roles and applies as the
+// owner, RLS confines the platform's runtime role (with its own login, or the
+// owner's credential after SET ROLE) and not the owner, which is the service
+// path; the Supabase roles need not exist; and without the runtime role the
+// bundle stops at a check that says how to enable it.
+func TestLiveSplitOnCapyDB(t *testing.T) {
+	admin, adminDSN := liveAdminDB(t)
+	ctx := context.Background()
+	var version int
+	if err := admin.QueryRowContext(ctx, "select current_setting('server_version_num')::int").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 160000 {
+		t.Skipf("the platform's runtime role needs Postgres 16 or newer (server is %d)", version)
+	}
+	var supabaseRoles int
+	if err := admin.QueryRowContext(ctx, "select count(*) from pg_roles where rolname in ('anon', 'authenticated', 'service_role')").Scan(&supabaseRoles); err != nil {
+		t.Fatal(err)
+	}
+	if supabaseRoles != 0 {
+		t.Fatal("the test server must not have the Supabase roles anon/authenticated/service_role: the test proves the bundle needs none")
+	}
+	t.Cleanup(func() { _, _ = admin.ExecContext(ctx, "drop role if exists app_user") })
+
+	t.Run("app_user missing", func(t *testing.T) {
+		db := liveCustomerDB(t, admin, adminDSN, "capyrls_live_split_missing")
+		if _, err := admin.ExecContext(ctx, "drop role if exists app_user"); err != nil {
+			t.Fatal(err)
+		}
+		res, err := Convert([]Source{{Name: "schema.sql", SQL: liveSchema}, {Name: "policies.sql", SQL: liveSupabasePolicies}},
+			Options{RoleModel: RoleSplit, Target: TargetCapyDB, UIDType: UIDText})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(liveSchema); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(findFile(t, res, "capyrls_01_prelude.sql")); err != nil {
+			t.Fatal(err)
+		}
+		_, err = db.Exec(findFile(t, res, "capyrls_02_roles.sql"))
+		if sqlState(err) != "P0001" || !strings.Contains(err.Error(), `role "app_user" does not exist: enable the runtime role for this project first`) {
+			t.Fatalf("roles file without app_user: err = %v, want the presence check (P0001)", err)
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && !strings.Contains(pgErr.Hint, "/roles/app") {
+			t.Errorf("presence check hint = %q, want the enable endpoint", pgErr.Hint)
+		}
+	})
+
+	for _, mode := range []Mode{ModeVanilla, ModeCompat} {
+		t.Run(mode.String(), func(t *testing.T) {
+			lc := liveContexts[mode]
+			name := "capyrls_live_split_" + strings.ReplaceAll(mode.String(), "-", "_")
+			owner := name + "_owner"
+			db := liveCustomerDB(t, admin, adminDSN, name)
+			livePlatformAppRole(t, admin, owner, name)
+
+			res, err := Convert([]Source{
+				{Name: "schema.sql", SQL: liveSchema},
+				{Name: "policies.sql", SQL: liveSupabasePolicies + liveAnonPolicy},
+			}, Options{Mode: mode, RoleModel: RoleSplit, UIDType: UIDText, Target: TargetCapyDB})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Nothing is FORCEd, so the definer keeps bypassing as the owner.
+			if len(res.Report.DefinerWrites) != 0 {
+				t.Errorf("definer writes = %+v, want none (no table is FORCEd)", res.Report.DefinerWrites)
+			}
+
+			// The whole bundle applies as the owner - no SUPERUSER, CREATEROLE or
+			// BYPASSRLS - with no Supabase role in existence.
+			if _, err := db.Exec(liveSchema); err != nil {
+				t.Fatalf("schema: %v", err)
+			}
+			for _, f := range res.Files {
+				if _, err := db.Exec(f.SQL); err != nil {
+					t.Fatalf("apply %s as the CapyDB owner: %v", f.Name, err)
+				}
+			}
+			// Re-applying is safe (a second deploy of the same bundle).
+			for _, f := range res.Files {
+				if _, err := db.Exec(f.SQL); err != nil {
+					t.Fatalf("re-apply %s: %v", f.Name, err)
+				}
+			}
+
+			// The owner is the service path: no context, no escape, every row.
+			if _, err := db.Exec(`insert into public.todos (owner_id, title, locked) values
+				('user_alice', 'a1', false), ('user_alice', 'a-locked', true),
+				('user_bob', 'b1', false), ('user_bob', 'public', false)`); err != nil {
+				t.Fatalf("owner inserting for other users: %v", err)
+			}
+
+			app, err := sql.Open("pgx", liveDSNAs(t, adminDSN, "app_user", "app-pw", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			app.SetMaxOpenConns(1)
+			t.Cleanup(func() { _ = app.Close() })
+
+			alice := [][2]string{{}}
+			alice[0][0], alice[0][1] = lc.user("user_alice")
+			bob := [][2]string{{}}
+			bob[0][0], bob[0][1] = lc.user("user_bob")
+
+			// runs is fn as the runtime role: its own login, and the owner's
+			// credential after SET LOCAL ROLE - both must behave the same.
+			runs := func(label string, gucs [][2]string, fn func(*sql.Tx) error) {
+				t.Helper()
+				if err := inTx(t, app, gucs, false, fn); err != nil {
+					t.Errorf("%s (app_user login): %v", label, err)
+				}
+				if err := inTx(t, db, gucs, false, func(tx *sql.Tx) error {
+					if _, err := tx.Exec("set local role app_user"); err != nil {
+						return err
+					}
+					return fn(tx)
+				}); err != nil {
+					t.Errorf("%s (owner, set role app_user): %v", label, err)
+				}
+			}
+			check := func(label string, gucs [][2]string, query string, want int) {
+				t.Helper()
+				runs(label, gucs, func(tx *sql.Tx) error {
+					got, err := count(tx, query)
+					if err != nil {
+						return err
+					}
+					if got != want {
+						t.Errorf("%s: %s = %d, want %d", label, query, got, want)
+					}
+					return nil
+				})
+			}
+			all := "select count(*) from public.todos"
+			if err := inTx(t, db, nil, false, func(tx *sql.Tx) error {
+				got, err := count(tx, all)
+				if err == nil && got != 4 {
+					t.Errorf("owner sees %d rows, want all 4 (owners bypass RLS on tables that are not FORCEd)", got)
+				}
+				return err
+			}); err != nil {
+				t.Error(err)
+			}
+			check("alice sees her rows only", alice, all, 2)
+			check("bob sees his rows only", bob, all, 2)
+			check("no token sees the anon rows only", nil, all, 1)
+			check("restrictive policy confines alice", alice,
+				"with u as (update public.todos set title = 'x' where title = 'a-locked' returning 1) select count(*) from u", 0)
+			check("alice updates her unlocked row", alice,
+				"with u as (update public.todos set title = 'x' where title = 'a1' returning 1) select count(*) from u", 1)
+
+			runs("alice inserts her own row", alice, func(tx *sql.Tx) error {
+				_, err := tx.Exec(`insert into public.todos (owner_id, title) values ('user_alice', 'mine')`)
+				return err
+			})
+			runs("alice cannot insert for bob", alice, func(tx *sql.Tx) error {
+				_, err := tx.Exec(`insert into public.todos (owner_id, title) values ('user_bob', 'forged')`)
+				if sqlState(err) != "42501" {
+					t.Errorf("alice inserting a row for bob: err = %v, want 42501", err)
+				}
+				return nil
+			})
+			// A SECURITY DEFINER function runs as the owner, which bypasses RLS
+			// here, so the cross-user write it exists for still works.
+			runs("the definer writes past the caller's policies", alice, func(tx *sql.Tx) error {
+				_, err := tx.Exec(`select public.gift_todo('user_bob', 'gift')`)
+				return err
+			})
+		})
+	}
+}

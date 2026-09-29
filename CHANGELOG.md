@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-09-30
+
+### Added
+
+- **The split role model works on CapyDB.** `--role-model split --target capydb`
+  (`Options{RoleModel: RoleSplit, Target: TargetCapyDB}`) is no longer refused: it uses the runtime
+  role CapyDB creates when a project enables it (`POST /v1/projects/{projectID}/roles/app`),
+  `app_user` - a login that owns nothing, cannot bypass RLS and is not a member of the owner, with
+  the owner allowed to `SET ROLE app_user`. The bundle creates no roles. `capyrls_02_roles.sql`
+  checks that `app_user` exists and otherwise stops with how to enable it, then grants to
+  `app_user` only (schema usage, table and sequence privileges, default privileges for what the
+  owner creates later). The owner is the service path - it bypasses row security on tables that
+  are not FORCEd - so there is no `BYPASSRLS` service role and nothing is granted to one; a
+  `service_role`-only policy is reported as covered by the owner. `anon`, `authenticated` and
+  `service_role` are not recreated in either mode: policies target `app_user` and keep the
+  anon/authenticated distinction as a predicate, as the single role model does. The report warns
+  about tables the source FORCEd (FORCE confines the owner too) and gives a CapyDB-specific fix for
+  `SECURITY DEFINER` functions that write to them: drop FORCE, not "hand the function to the
+  `BYPASSRLS` role". Live tests apply the bundle as a CapyDB-shaped owner next to a platform-shaped
+  `app_user` on postgres:16 and postgres:18.
+
+### Changed
+
+- **`ErrSplitRolesUnsupported` now means a custom runtime role on CapyDB.** It is returned for
+  `TargetCapyDB` with the split model and an `AppRole` other than `app_user` (the bundle cannot
+  create it); the split model itself is accepted. `ServiceRole` is unused on CapyDB.
+
 ## [1.15.0] - 2026-09-29
 
 ### Added
@@ -232,7 +259,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Importable, dependency-free Go library (`capyrls` package) and `live`
   subpackage for `*sql.DB` introspection.
 
-[Unreleased]: https://github.com/capydatabase/capyrls/compare/v1.15.0...HEAD
+[Unreleased]: https://github.com/capydatabase/capyrls/compare/v1.16.0...HEAD
+[1.16.0]: https://github.com/capydatabase/capyrls/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/capydatabase/capyrls/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/capydatabase/capyrls/compare/v1.13.1...v1.14.0
 [1.13.1]: https://github.com/capydatabase/capyrls/compare/v1.13.0...v1.13.1

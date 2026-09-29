@@ -29,7 +29,7 @@ import (
 )
 
 // Version is the capyrls release version.
-const Version = "1.15.0"
+const Version = "1.16.0"
 
 // Mode selects the output convention.
 type Mode int
@@ -54,7 +54,9 @@ type RoleModel int
 
 const (
 	// RoleSplit creates a non-owning runtime role (RLS applies) and a
-	// BYPASSRLS service role - the classic three-role convention.
+	// BYPASSRLS service role - the classic three-role convention. On
+	// TargetCapyDB the platform provides the runtime role and the owner is
+	// the service path, so the bundle creates no roles (see TargetCapyDB).
 	RoleSplit RoleModel = iota
 	// RoleSingle assumes the app connects as the table owner (the common
 	// managed-Postgres setup) and FORCEs row security instead.
@@ -90,9 +92,9 @@ func (u UIDType) String() string {
 	return "uuid"
 }
 
-// Target names the platform the bundle will be applied to. The converter's
-// SQL is platform-neutral; the target only rejects configurations that
-// cannot be applied there, before any output is produced.
+// Target names the platform the bundle will be applied to. It rejects
+// configurations that cannot be applied there, before any output is produced,
+// and shapes the split model's roles file to the roles the platform provides.
 type Target int
 
 const (
@@ -100,9 +102,16 @@ const (
 	// (self-managed, or a managed service that grants CREATEROLE).
 	TargetPostgres Target = iota
 	// TargetCapyDB is a CapyDB database. Its database role owns the tables and
-	// has neither SUPERUSER, CREATEROLE nor BYPASSRLS, and every login role the
-	// platform issues acts as that owner (`SET role` on connect). No role that
-	// does not own the tables exists or can be created.
+	// has neither SUPERUSER, CREATEROLE nor BYPASSRLS, so the bundle may create
+	// no roles. The single role model needs none. The split model uses the
+	// platform's runtime role instead of creating one: a project that enables
+	// it (POST /v1/projects/{id}/roles/app) gets app_user, a login that owns
+	// nothing and is not a member of the owner, so row security applies to it,
+	// while the owner may SET ROLE app_user. The owner, which bypasses row
+	// security on tables that are not FORCEd, is the split model's service
+	// path, so no BYPASSRLS role is needed: the roles file checks that app_user
+	// exists and grants to it, and Options.ServiceRole is unused. A custom
+	// Options.AppRole is rejected with ErrSplitRolesUnsupported.
 	TargetCapyDB
 )
 
@@ -113,17 +122,20 @@ func (t Target) String() string {
 	return "postgres"
 }
 
-// ErrSplitRolesUnsupported is returned for the split role model on a target
-// that cannot create roles (TargetCapyDB). The split model is two roles the
-// bundle creates: a runtime role that does not own the tables, and a service
-// role that bypasses RLS. On CapyDB the database role can do neither, and no
-// non-owning role exists for the bundle to grant to instead, so the bundle
-// would stop at its first CREATE ROLE. Use the single role model.
+// ErrSplitRolesUnsupported is returned for the split role model on
+// TargetCapyDB with a runtime role other than the platform's app_user. The
+// bundle cannot create that role (a CapyDB database role has no CREATEROLE),
+// and the platform creates only app_user.
 var ErrSplitRolesUnsupported = errors.New(
-	"the split role model cannot be applied on CapyDB: it creates a runtime role that does not own your tables " +
-		"and a BYPASSRLS service role, and a CapyDB database role has neither CREATEROLE nor BYPASSRLS " +
-		"(and every CapyDB login acts as the owner, so there is no existing non-owning role to use instead); " +
-		"use --role-model single, which FORCEs row security on the owner and needs no roles")
+	"on CapyDB the split role model uses the platform's runtime role " + capydbAppRole + "; a custom runtime role " +
+		"cannot be used there, because a CapyDB database role has no CREATEROLE to create it - keep the app role " +
+		capydbAppRole + " (and enable the runtime role for the project), or use --role-model single")
+
+// capydbAppRole is the runtime role CapyDB creates for a project that enables
+// the split role model, and the default Options.AppRole everywhere, so a split
+// bundle for any target grants to the same name. KEEP IN LOCKSTEP with
+// AppRoleName in the CapyDB control plane (backend internal/model).
+const capydbAppRole = "app_user"
 
 // Options control a conversion. The zero value is the recommended setup:
 // vanilla mode, role-split model, FOR ALL policies split per command, service
@@ -139,7 +151,8 @@ type Options struct {
 	NoServiceEscape bool
 	// Prefix is the schema and GUC namespace, default "app".
 	Prefix string
-	// AppRole and ServiceRole name the roles for the role-split model.
+	// AppRole and ServiceRole name the roles for the role-split model. On
+	// TargetCapyDB AppRole must be empty or app_user and ServiceRole is unused.
 	AppRole     string
 	ServiceRole string
 	// UIDType is the user-id accessor's return type, default uuid.
@@ -150,10 +163,17 @@ type Options struct {
 
 // check rejects option combinations the target cannot apply.
 func (o Options) check() error {
-	if o.Target == TargetCapyDB && o.RoleModel == RoleSplit {
-		return ErrSplitRolesUnsupported
+	if o.Target == TargetCapyDB && o.RoleModel == RoleSplit && o.AppRole != "" && o.AppRole != capydbAppRole {
+		return fmt.Errorf("app role %q: %w", o.AppRole, ErrSplitRolesUnsupported)
 	}
 	return nil
+}
+
+// splitOnCapyDB reports the split role model on CapyDB: the platform owns the
+// runtime role and the owner is the service path, so the bundle creates no
+// roles and grants to the runtime role only.
+func (o Options) splitOnCapyDB() bool {
+	return o.Target == TargetCapyDB && o.RoleModel == RoleSplit
 }
 
 func (o Options) withDefaults() Options {
@@ -161,7 +181,7 @@ func (o Options) withDefaults() Options {
 		o.Prefix = "app"
 	}
 	if o.AppRole == "" {
-		o.AppRole = "app_user"
+		o.AppRole = capydbAppRole
 	}
 	if o.ServiceRole == "" {
 		o.ServiceRole = "app_service"
@@ -527,6 +547,16 @@ func ConvertCatalog(cat *Catalog, opts Options) (*Result, error) {
 			forced[t.Name.Key()] = t.Name
 		}
 	}
+	if opts.splitOnCapyDB() && len(forced) > 0 {
+		names := make([]string, 0, len(forced))
+		for key := range forced {
+			names = append(names, key)
+		}
+		sort.Strings(names)
+		rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+			"table(s) %s are FORCEd in the source; on CapyDB the split model's service path is the owner, and FORCE applies the policies to the owner too - `alter table ... no force row level security` on each, unless you mean to confine the owner as well",
+			strings.Join(names, ", ")))
+	}
 	rep.DefinerWrites = definerWrites(cat, forced)
 	if len(rep.DefinerWrites) > 0 {
 		rep.DefinerFix = definerFix(opts)
@@ -633,7 +663,11 @@ func Rewrite(sources []Source, opts Options) (*Result, error) {
 	sort.Strings(sortedCompatRoles)
 	if len(sortedCompatRoles) > 0 {
 		msg := "capyrls_02_roles.sql creates them as membership roles"
-		if opts.RoleModel == RoleSingle {
+		if opts.splitOnCapyDB() {
+			// The CapyDB roles file creates no roles either: the database role
+			// cannot, and convert does not need them.
+			msg = "rewrite keeps TO clauses as written, and on CapyDB the roles file cannot create them (a CapyDB database role cannot create roles), so those policies stop the apply - `convert` renders them as predicates on the runtime role instead and needs no roles"
+		} else if opts.RoleModel == RoleSingle {
 			// No roles file under the single role model: rewrite keeps the TO
 			// clauses, so the roles have to exist before the files apply.
 			msg = "rewrite keeps TO clauses as written and the single role model creates no roles, so they must exist before these files apply - `convert` renders them as predicates instead and needs no roles"
