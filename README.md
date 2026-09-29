@@ -48,7 +48,7 @@ sets typed facts per transaction:
 | deep claim paths | `(select app.claims())` blob fallback, flagged in the report |
 | `TO authenticated` | runtime role + `(select app.user_id()) is not null` |
 | `TO anon` | `(select app.user_id()) is null` |
-| `service_role` | a `BYPASSRLS` role (or the single-role service escape) |
+| `service_role` | a `BYPASSRLS` role (or the single-role service escape; on CapyDB's split model, the owner) |
 | `FOR ALL` policies | split into per-command policies (disable with `--keep-for-all`) |
 
 Your app sets the context inside each transaction - `set_config(..., true)` is
@@ -70,7 +70,8 @@ verbatim. Two limits to know before choosing it:
 - With the default split role model it recreates `anon`, `authenticated` and
   `service_role` as real roles. `CREATE ROLE` needs `CREATEROLE`, which a
   managed database role usually lacks (a CapyDB customer role does not have
-  it). With `--role-model single` no roles are created.
+  it). With `--role-model single`, or with `--target capydb`, no roles are
+  created: the role targets become `auth.role()` predicates instead.
 - Under `--role-model single` the service path is claims-based: the bundle
   emits a service escape that admits a transaction whose verified claims carry
   `"role": "service_role"` - what a Supabase service key's JWT said. Set that
@@ -113,7 +114,8 @@ the same change by hand.
   RLS) and `app_service` (`BYPASSRLS`, replaces `service_role`). Owners bypass
   RLS in Postgres - runtime traffic must never connect as the role that owns
   the tables, and this model makes that structural. Applying it needs
-  `CREATEROLE`, and creating the `BYPASSRLS` role needs more privilege still.
+  `CREATEROLE`, and creating the `BYPASSRLS` role needs more privilege still -
+  except on CapyDB, where it creates no roles (see below).
 - `--role-model single`: for managed platforms where the app connects as the
   table owner. Emits `FORCE ROW LEVEL SECURITY` plus a service escape
   (`--no-service-escape` to omit): `app.role = 'service'` in vanilla mode,
@@ -124,22 +126,53 @@ the same change by hand.
 
 ### The split model on CapyDB (`--target capydb`)
 
-`--target capydb` rejects `--role-model split` before producing anything
-(`capydb migrate rls` always sets it). The split model needs a role that does
-not own the tables, and a CapyDB database role can neither create one
-(`CREATEROLE`) nor make one bypass RLS (`BYPASSRLS`). Nor does one exist to
-grant to instead: every login CapyDB issues is a member of the owning role and
-switches to it on connect (`SET role`), so it IS the owner for row security.
+A CapyDB database role can create no roles, so on CapyDB the split model uses
+the runtime role the platform provides instead of creating one:
 
-What it would take is a platform change, not a converter change: a second,
-platform-created login role per database that is `NOSUPERUSER NOCREATEROLE
-NOBYPASSRLS` and **not** a member of the owner, with the owner granted
-membership in it `WITH INHERIT FALSE, SET TRUE` (Postgres 16+) so one
-credential can also `SET ROLE` to it, and its own credential exposed next to
-the owner's. The owner itself would then be the service path (owners bypass
-RLS on tables that are not FORCEd), so no `BYPASSRLS` role is needed and the
-bundle's roles file becomes grants only. Until then, use the single role
-model.
+1. **Enable the runtime role for the project**:
+   `POST /v1/projects/{projectID}/roles/app` (an API key with
+   `projects:write`; Postgres 16 or newer). The platform creates `app_user` on
+   the project's database: a login that owns nothing, cannot bypass RLS, and
+   is not a member of the owner. The owner is granted membership in it
+   `WITH INHERIT FALSE, SET TRUE`, so the owner's credential can
+   `SET ROLE app_user` but gains none of its privileges, and `app_user` can
+   never become the owner. Its connection strings appear next to the owner's.
+2. **Convert with `--role-model split --target capydb`** (`capydb migrate rls
+   --role-model split`; the runtime role is always `app_user` - a custom
+   `--app-role` is refused, since the bundle could not create it) and apply the
+   bundle as the owner, the role that runs your migrations.
+3. **Send request traffic through `app_user`**: connect with its own
+   credential, or keep the owner's and switch inside each transaction
+   (`begin; set local role app_user; ...` - a session-level `SET ROLE` behind
+   a transaction pooler reaches the next client). Row security applies to it.
+
+What the bundle does on CapyDB:
+
+- **Creates no roles.** `capyrls_02_roles.sql` starts with a check that
+  `app_user` exists and stops with the steps above if it does not, then grants
+  `app_user` usage on the context schema, the table and sequence privileges in
+  the policy schemas, and the same by default for tables and sequences the
+  owner creates later (`alter default privileges` without `FOR ROLE` applies to
+  the role running it - the owner).
+- **Has no service role.** The owner is the service path: owners bypass row
+  security on tables that are not FORCEd, which is what `BYPASSRLS` gave
+  `service_role`. Keep the owner's credential for migrations, backfills and
+  admin jobs. A `service_role`-only policy is reported as covered by the
+  owner; `SECURITY DEFINER` functions owned by the owner keep bypassing
+  row security, as they did on Supabase. The split model does not FORCE
+  tables, but a table the source already FORCEd confines the owner too: the
+  report names those tables, and `alter table ... no force row level security`
+  restores the service path on them.
+- **Does not recreate `anon`, `authenticated` or `service_role`**, in either
+  mode. Policies written `TO anon` / `TO authenticated` target `app_user` and
+  keep the distinction as a predicate - `(select app.user_id()) is null` /
+  `is not null` in vanilla mode, `auth.role() = 'anon'` / `'authenticated'` in
+  compat mode (the shim reads a caller with no claims as `anon`). That is the
+  more faithful reading, too: on a plain Postgres the compat bundle makes the
+  runtime role a member of both roles, so an anon-only policy also applies to
+  signed-in callers; the predicate does not. `capyrls rewrite` keeps `TO`
+  clauses as written and cannot do this, so use `convert` for CapyDB when your
+  policies name those roles.
 
 ## What it refuses to guess
 
@@ -156,7 +189,9 @@ mistranslated:
   why the function is a definer now fails with `42501`. The report lists each
   one with the fix for your configuration: raise the service escape inside the
   body and restore it on the way out, or, under the split model, hand the
-  function to the `BYPASSRLS` role. Writes through `EXECUTE` are not seen.
+  function to the `BYPASSRLS` role (on CapyDB, where no such role exists, drop
+  FORCE from the table so the owner bypasses again). Writes through `EXECUTE`
+  are not seen.
 
 Run with `--strict` in CI to fail when anything needs manual attention.
 
