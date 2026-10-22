@@ -143,8 +143,7 @@ func liveCustomerDB(t *testing.T, admin *sql.DB, adminDSN, name string) *sql.DB 
 }
 
 func sqlState(err error) string {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		return pgErr.Code
 	}
 	return ""
