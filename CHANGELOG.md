@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Go 1.27.4; pgx 5.13.0, x/sync 0.25.0, x/text 0.44.0. No behaviour change.
+
 ## [1.16.0] - 2026-09-30
 
 ### Added
