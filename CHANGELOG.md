@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Go 1.27.4; pgx 5.13.0, x/sync 0.25.0, x/text 0.44.0. No behaviour change.
+- Go 1.27.4; pgx 5.13.0 (puddle 2.2.4), x/sync 0.25.0, x/text 0.44.0. CI lints with golangci-lint
+  v2.15.0. No behaviour change.
 
 ## [1.16.0] - 2026-09-30
 
